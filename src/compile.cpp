@@ -195,14 +195,27 @@ bool require_object(const json_t* v, const char* what) {
 std::string compile_triple(const json_t* triple, Ctx& ctx, const std::string& alias) {
     std::vector<std::string> clauses;
     clauses.push_back("st.is_active");
-    clauses.push_back("(" + alias + ".id = st.subject_id OR " + alias + ".id = st.object_id)");
+
+    const json_t* dir_v = json_object_get(triple, "direction");
+    std::string dir = "both";
+    if (dir_v) {
+        if (!json_is_string(dir_v)) throw std::runtime_error("[JSE] $triple direction must be a string");
+        dir = json_string_value(dir_v);
+        if (dir != "out" && dir != "in" && dir != "both")
+            throw std::runtime_error("[JSE] $triple direction must be out/in/both");
+    }
+    if (dir == "out") clauses.push_back(alias + ".id = st.object_id");
+    else if (dir == "in") clauses.push_back(alias + ".id = st.subject_id");
+    else clauses.push_back("(" + alias + ".id = st.subject_id OR " + alias + ".id = st.object_id)");
+
     const json_t* s = json_object_get(triple, "subject");
     const json_t* p = json_object_get(triple, "predicate");
     const json_t* o = json_object_get(triple, "object");
-    if (json_is_string(s)) clauses.push_back("st.subject_id = " + key_id_subquery(ctx, json_string_value(s)));
-    if (json_is_string(p)) clauses.push_back("st.predicate_id = " + key_id_subquery(ctx, json_string_value(p)));
-    if (json_is_string(o)) clauses.push_back("st.object_id = " + key_id_subquery(ctx, json_string_value(o)));
-    if (clauses.size() == 2) throw std::runtime_error("[JSE] $triple needs at least one endpoint");
+    bool has_endpoint = false;
+    if (json_is_string(s)) { clauses.push_back("st.subject_id = " + key_id_subquery(ctx, json_string_value(s))); has_endpoint = true; }
+    if (json_is_string(p)) { clauses.push_back("st.predicate_id = " + key_id_subquery(ctx, json_string_value(p))); has_endpoint = true; }
+    if (json_is_string(o)) { clauses.push_back("st.object_id = " + key_id_subquery(ctx, json_string_value(o))); has_endpoint = true; }
+    if (!has_endpoint) throw std::runtime_error("[JSE] $triple needs at least one endpoint");
     std::string out = "EXISTS (SELECT 1 FROM statement st WHERE ";
     for (size_t i = 0; i < clauses.size(); ++i) {
         if (i) out += " AND ";
@@ -265,6 +278,13 @@ std::string compile_khop(const json_t* hop, Ctx& ctx, const std::string& alias) 
 
 std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias) {
     if (!json_is_object(node)) throw std::runtime_error("[JSE] node must be an object");
+
+    static const char* op_keys[] = {"$and", "$or", "$not", "$meta", "$fti", "$search", "$triple", "$k-hop"};
+    int present = 0;
+    for (const char* k : op_keys) {
+        if (json_object_get(node, k)) present++;
+    }
+    if (present > 1) throw std::runtime_error("[JSE] a node must contain exactly one operator");
 
     if (const json_t* v = json_object_get(node, "$and")) {
         if (!json_is_array(v) || json_array_size(v) == 0) throw std::runtime_error("[JSE] $and requires non-empty array");
@@ -396,6 +416,8 @@ CompiledQuery compile_query(const json_t* query, const std::vector<VectorHit>& v
             const json_t* val = json_object_iter_value(iter);
             if (idx++) order_sql += ", ";
             if (!json_is_string(val)) throw std::runtime_error("[JSE] $order values must be 'asc'/'desc'");
+            if (std::string(k) == "$search_score" && !ctx.has_search)
+                throw std::runtime_error("[JSE] $order $search_score requires a $search node");
             order_sql += order_expr(alias, k, json_string_value(val));
             iter = json_object_iter_next(const_cast<json_t*>(order), iter);
         }

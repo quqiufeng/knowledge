@@ -19,16 +19,27 @@ std::string shell_quote(const std::string& s) {
     return out;
 }
 
-std::string run_capture(const std::string& cmd) {
+std::string run_capture(const std::string& cmd, int& rc) {
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) throw std::runtime_error("[VECTOR] popen failed");
     std::string out;
     char buf[4096];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
-    int rc = pclose(p);
-    if (rc != 0) throw std::runtime_error("[VECTOR] provider exited with code " + std::to_string(rc));
+    rc = pclose(p);
     return out;
+}
+
+json_t* parse_json_tolerant(const std::string& out) {
+    json_error_t err;
+    json_t* root = json_loads(out.c_str(), 0, &err);
+    if (root) return root;
+    for (size_t pos = out.find_first_of("{["); pos != std::string::npos;
+         pos = out.find_first_of("[{", pos + 1)) {
+        root = json_loads(out.c_str() + pos, 0, &err);
+        if (root) return root;
+    }
+    return nullptr;
 }
 
 }  // namespace
@@ -38,11 +49,14 @@ std::vector<VectorHit> run_vector_provider(const std::string& cmd, const std::st
     if (cmd.empty()) return hits;
 
     std::string full = cmd + " " + shell_quote(query) + " " + std::to_string(k);
-    std::string out = run_capture(full);
+    int rc = 0;
+    std::string out = run_capture(full, rc);
 
-    json_error_t err;
-    json_t* root = json_loads(out.c_str(), 0, &err);
-    if (!root) throw std::runtime_error(std::string("[VECTOR] provider returned invalid JSON: ") + err.text);
+    json_t* root = parse_json_tolerant(out);
+    if (!root) {
+        throw std::runtime_error("[VECTOR] provider produced no JSON (exit=" + std::to_string(rc) +
+                                 ", bytes=" + std::to_string(out.size()) + ")");
+    }
 
     const json_t* arr = root;
     if (json_is_object(root)) {

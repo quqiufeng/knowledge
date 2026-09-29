@@ -20,7 +20,10 @@ $(BIN): $(OBJ)
 src/%.o: src/%.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
+test: $(BIN)
+	./tests/smoke.sh
+
 clean:
 	rm -f $(OBJ) $(BIN)
 
-.PHONY: all clean
+.PHONY: all clean test

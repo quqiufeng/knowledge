@@ -1,0 +1,66 @@
+#!/bin/bash
+# Smoke tests for the knowledge binary (JSE compiler + PG end-to-end).
+set -uo pipefail
+cd "$(dirname "$0")/.."
+BIN=./knowledge
+pass=0
+fail=0
+
+ok()  { echo "  ok   - $1"; pass=$((pass + 1)); }
+bad() { echo "  FAIL - $1"; fail=$((fail + 1)); }
+has() { if echo "$2" | grep -q "$1"; then ok "$3"; else bad "$3"; fi; }
+rejects() { if eval "$1" >/dev/null 2>&1; then bad "$2 (expected rejection)"; else ok "$2"; fi; }
+
+[ -x "$BIN" ] || { echo "build first: make"; exit 1; }
+
+echo "[smoke] compiler"
+
+tokens=$($BIN tokenize "__alloc_pages_slowpath AllocPageSlow")
+has '"alloc"' "$tokens" "tokenize splits snake_case"
+has '"allocpageslow"' "$tokens" "tokenize splits camelCase"
+
+sql=$(echo '{"$where":{"$fti":"page_alloc"}}' | $BIN compile)
+has 'to_tsquery' "$sql" "compile \$fti -> tsquery"
+has 'search_tsv' "$sql" "compile uses search_tsv"
+
+rejects "echo '{\"\$where\":{\"\$meta\":{\"path\":\"kind\"}}}' | $BIN compile" "\$meta without operator rejected"
+rejects "echo '{\"\$where\":{\"\$and\":[{\"\$fti\":\"a\"}],\"\$fti\":\"b\"}}' | $BIN compile" "multiple operators rejected"
+rejects "echo '{\"\$where\":{\"\$meta\":{\"path\":\"kind; DROP TABLE knowledge;--\",\"\$eq\":\"x\"}}}' | $BIN compile" "path injection rejected"
+rejects "echo '{\"\$where\":{\"\$fti\":\"a\"},\"\$order\":{\"\$search_score\":\"desc\"}}' | $BIN compile" "\$search_score requires \$search"
+rejects "echo '{\"\$where\":{\"\$triple\":{}}}' | $BIN compile" "\$triple without endpoint rejected"
+
+echo "[smoke] postgres"
+
+if ! $BIN seed >/dev/null 2>&1; then
+    echo "  SKIP - database unavailable"
+    echo "[smoke] $pass passed, $fail failed"
+    [ "$fail" -eq 0 ] || exit 1
+    exit 0
+fi
+
+rows=$(echo '{"$where":{"$and":[{"$meta":{"path":"kind","$eq":"function"}},{"$fti":"page_alloc"}]},"$project":["key"],"$limit":50}' | $BIN query | grep -c '"key"')
+[ "$rows" -ge 4 ] && ok "full-text query returns $rows rows" || bad "full-text query returned $rows rows (expected >=4)"
+
+out=$(echo '{"$where":{"$triple":{"subject":"/code/local/linux/mm/page_alloc.c/__alloc_pages_slowpath","predicate":"/pred/calls","direction":"out"}},"$project":["key"],"$limit":10}' | $BIN query)
+has 'prepare_alloc_pages' "$out" "\$triple direction out returns callee"
+if echo "$out" | grep -q '"meta.symbol": "__alloc_pages_slowpath"'; then
+    bad "\$triple direction out leaked the anchor"
+else
+    ok "\$triple direction out excludes anchor"
+fi
+
+echo "[smoke] vector provider robustness"
+
+noisy=$(mktemp /tmp/vp_noisy.XXXXXX.sh)
+cat >"$noisy" <<'EOF'
+#!/bin/bash
+echo "[INFO] model warmup"
+echo '{"results":[{"key":"/code/local/linux/mm/page_alloc.c/alloc_pages","score":0.9}]}'
+EOF
+chmod +x "$noisy"
+out=$($BIN search "memory" --k 1 --vector-cmd "$noisy" 2>&1)
+has 'alloc_pages' "$out" "search tolerates noisy provider output"
+rm -f "$noisy"
+
+echo "[smoke] $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

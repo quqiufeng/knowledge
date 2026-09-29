@@ -255,6 +255,7 @@ C++ 侧 `src/vector.cpp` 用 `popen` 调用并解析，结果喂给 `compile_que
 Makefile              # 编译出单一二进制 knowledge
 schema.sql            # DDL（PG16）
 src/
+  util.hpp            # 公共工具（COPY 转义 / relpath / UTF-8 截断）
   tokenize.hpp/.cpp   # 代码标识符分词器
   compile.hpp/.cpp    # JSE 校验 + 编译器（jansson + 参数化 SQL）
   vector.hpp/.cpp     # 外挂向量引擎 provider 调用
@@ -263,6 +264,7 @@ src/
   db.hpp/.cpp         # libpq 连接与查询
   main.cpp            # CLI（tokenize / compile / query / search / context / import / import-books / seed）
 tools/                # ingest.sh（一键分析+入库）、vector_provider.sh、vector_provider_books.sh、vector_provider_stub.sh
+tests/smoke.sh        # 回归测试（编译器 + PG 端到端 + provider 健壮性），make test
 prompts/              # 向 Google AI 提问的三弹材料 + 统一 brief
 README.md             # 快速上手
 design.md             # 本文档
@@ -302,6 +304,8 @@ design.md             # 本文档
 - [x] **一键流水线**：`tools/ingest.sh <repo>` = 分析（index/vector/hnsw）+ 入库；`--skip-analyze` 仅导入
 - [x] **token 友好输出**：`meta`/`content` 返回嵌套对象（不再双重转义）；`search` 默认回 `key/symbol/file/line/signature/score`；`context` 支持 `--no-content` / `--max-code-bytes`
 - [x] **电子书输入源**：`knowledge import-books`，`/opt/books/{book}/chapters/**/page_*.md` → book/chapter/page 条目 + `contains` 关系；`tools/vector_provider_books.sh` 接入 book 向量（key 与 `cache_query` 的 `name` 天然对齐）
+- [x] **代码复盘加固**：修复 `$search_score` 无 `$search` 的非法 SQL；拒绝一个节点含多个算子；`$triple` 增加 `direction`（out/in/both）且语义修正；provider 容忍杂音输出；公共工具抽到 `src/util.hpp`；书籍正文不再整页写入 `search_tsv`（截断 4KB）
+- [x] **回归测试**：`tests/smoke.sh` + `make test`（编译器 + PG 端到端 + provider 健壮性，13 项）
 
 ### 进行中 🚧
 
@@ -310,7 +314,6 @@ design.md             # 本文档
 
 ### 待办 ⏳
 
-- [ ] **smoke test**：固化 4 类查询 + context 的回归测试
 - [ ] **迁移对账（第三弹 E14）**：mmap 旧系统 vs PG 新系统的双跑 diff 与灰度切流
 - [ ] **规范条目（第三弹 F17/F18）**：`meta.category=spec` 定义字段约束，写入校验与编译器共享路径白名单
 - [ ] **LLM 报错闭环（第三弹 H24）**：语法/安全/规范三层结构化 Error Payload + System Prompt

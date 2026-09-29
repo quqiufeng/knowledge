@@ -1,6 +1,7 @@
 #include "importer.hpp"
 
 #include "tokenize.hpp"
+#include "util.hpp"
 
 #include <jansson.h>
 
@@ -15,36 +16,14 @@
 
 namespace {
 
+using namespace kutil;
+
 constexpr size_t FLUSH_BYTES = 8 * 1024 * 1024;
 
 const char* P_CALLS = "/pred/calls";
 const char* P_DEFINES = "/pred/defines";
 const char* P_ASSIGNS = "/pred/assigns";
 const char* P_USES = "/pred/uses";
-
-std::string escape_copy(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-            case '\\': out += "\\\\"; break;
-            case '\t': out += "\\t"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            default: out += c;
-        }
-    }
-    return out;
-}
-
-std::string relpath_of(const std::string& file, const std::string& root) {
-    if (!root.empty() && file.rfind(root, 0) == 0) {
-        std::string r = file.substr(root.size());
-        if (!r.empty() && r[0] == '/') r = r.substr(1);
-        return r;
-    }
-    return (!file.empty() && file[0] == '/') ? file.substr(1) : file;
-}
 
 std::string make_key(const std::string& project, const std::string& rel, const std::string& name) {
     return "/code/local/" + project + "/" + rel + "/" + name;
@@ -58,14 +37,6 @@ std::string jstr(const json_t* o, const char* k) {
 json_int_t jint(const json_t* o, const char* k) {
     const json_t* v = json_object_get(o, k);
     return json_is_integer(v) ? json_integer_value(v) : 0;
-}
-
-std::string dump_owned(json_t* o) {
-    char* s = json_dumps(o, JSON_COMPACT);
-    std::string out = s ? s : "";
-    if (s) free(s);
-    json_decref(o);
-    return out;
 }
 
 std::string build_meta(const std::string& kind, const std::string& lang, const std::string& rel,

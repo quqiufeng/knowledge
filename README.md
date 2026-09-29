@@ -147,6 +147,9 @@ export ANALYSIS_DIR=/opt/code_caches/redis_cache PROJECT=redis ROOT=/opt/redis
 
 # 9. 一次性取完整上下文包（定义 + 调用关系 + 调用路径 + 语义近邻）
 ./knowledge context /code/local/redis/src/module.c/RM_PoolAlloc --depth 2
+
+# 10. 回归测试
+make test
 ```
 
 连接串通过 `DATABASE_URL` 覆盖，默认 `postgres://knowledge:knowledge@127.0.0.1:5432/knowledge`。
@@ -297,7 +300,7 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 - `$meta`：`path` + `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists`
 - `$fti`：全文（应用层分词，OR 语义）
 - `$search`：向量（外挂引擎提供 `vectors` 候选，按 `$search_score` 排序）
-- `$triple`：`subject` / `predicate` / `object` 边匹配
+- `$triple`：`subject` / `predicate` / `object` 边匹配；`direction`（`out` 沿指定 subject 的出边 / `in` 入边 / `both` 默认两端）
 - `$k-hop`：`from` / `predicates` / `depth` / `direction` / `where`，ID 拓扑遍历 + path 防环
 - 修饰符：`$project` / `$order` / `$limit` / `$offset`
 

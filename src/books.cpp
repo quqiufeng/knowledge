@@ -1,5 +1,7 @@
 #include "books.hpp"
 
+#include "util.hpp"
+
 #include <jansson.h>
 
 #include <algorithm>
@@ -14,36 +16,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
+using namespace kutil;
+
 constexpr size_t FLUSH_BYTES = 8 * 1024 * 1024;
 const char* P_CONTAINS = "/pred/contains";
-
-std::string escape_copy(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-            case '\\': out += "\\\\"; break;
-            case '\t': out += "\\t"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            default: out += c;
-        }
-    }
-    return out;
-}
-
-std::string read_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
-
-std::string dump_owned(json_t* o) {
-    char* s = json_dumps(o, JSON_COMPACT | JSON_ENSURE_ASCII);
-    std::string out = s ? s : "";
-    if (s) free(s);
-    json_decref(o);
-    return out;
-}
 
 std::string clean_page(std::string md) {
     auto trim_front = [](std::string& s) {
@@ -216,7 +192,8 @@ void import_books(Db& db, const BooksOptions& opt) {
                 json_t* pcontent = json_object();
                 json_object_set_new(pcontent, "text", json_string(text.c_str()));
 
-                stage.add_knowledge(page_key, dump_owned(pmeta), dump_owned(pcontent), text);
+                stage.add_knowledge(page_key, dump_owned(pmeta), dump_owned(pcontent),
+                                    truncate_utf8(text, 4096));
                 stage.add_edge(chapter_key, P_CONTAINS, page_key);
                 pages++;
             }
