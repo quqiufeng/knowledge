@@ -505,6 +505,29 @@ Agent 可以把本库当**长期记忆/大脑**：自主写入与检索。写入
 
 ---
 
+## 语料导出（训练用 JSONL）
+
+把知识库直接导出成结构化训练语料（带 provenance 与关系），用于微调/训练数据生产：
+
+```bash
+# 关系语料：每条边一行 {subject, predicate, object, subject_meta, object_meta}
+./knowledge export --preset edges --predicate /pred/calls \
+  --key-prefix /code/local/linux/ --limit 100000 > calls.jsonl
+
+# 上下文语料：每个函数一条完整上下文包（定义 + callers/callees + 路径）
+./knowledge export --preset context \
+  --key-prefix /code/local/linux/mm/ --depth 1 --no-content --limit 5000 > ctx.jsonl
+```
+
+- `--no-content` / `--depth` 控制记录体量与 token 开销。
+- 输出逐行 JSON（JSONL），可直接接 SFT / 指令数据管线。
+- 价值：给模型**精确的类型定义、调用/依赖上下文、数据流、可追溯来源**，而不是让它猜。
+
+> 定位提醒：导出的是**上下文与监督信号**，仍需套一层任务模板（NL→代码、补全、问答、代码审查）；
+> 覆盖度与许可需自行把关。
+
+---
+
 ## JSE 算子（当前实现）
 
 - `$and` / `$or` / `$not`

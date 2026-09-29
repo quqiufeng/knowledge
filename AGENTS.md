@@ -42,6 +42,7 @@ export KNOWLEDGE_VECTOR_CMD=./tools/vector_provider.sh      # 外挂引擎（可
 | `remember` / `fact` | Agent 记忆（情景事件 / 键值事实） | 写（本地） |
 | `link` / `forget` / `restore` | 建关系 / 归档 / 恢复 | 写（本地） |
 | `spec-set` | 定义某类条目的规范（schema-as-data） | 写（本地） |
+| `export` | 导出训练语料 JSONL（`--preset edges\|context`） | 读 |
 | `import` `import-books` `import-records` `import-vectors` | 导入数据 | 写（本地） |
 
 ---
@@ -156,7 +157,13 @@ echo '{"$where":{"$key":{"$prefix":"/code/local/linux/"}},"$group_by":"meta.kind
 
 **D. 跨源**：不写 `$key` 前缀即可跨代码/电子书/记录一起检索（同一张图，可 join）。
 
-**E. 作为记忆（本地写）**
+**E. 导出训练语料（JSONL）**
+```bash
+./knowledge export --preset edges   --predicate /pred/calls --key-prefix /code/local/linux/ > calls.jsonl
+./knowledge export --preset context --key-prefix /code/local/linux/mm/ --depth 1 --no-content > ctx.jsonl
+```
+
+**F. 作为记忆（本地写）**
 ```bash
 ./knowledge remember --agent me --text "结论：..." --about <key> --tag note
 ./knowledge fact     --agent me --topic preferred_db --value '"postgresql"'   # 覆盖即归档旧值

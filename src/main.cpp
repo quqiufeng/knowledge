@@ -5,6 +5,7 @@
 #include "importer.hpp"
 #include "action.hpp"
 #include "embed.hpp"
+#include "export.hpp"
 #include "memory.hpp"
 #include "records.hpp"
 #include "server.hpp"
@@ -219,6 +220,10 @@ int usage() {
                  "  forget   <key> [--force] [--agent id]\n"
                  "  restore  <key> [--agent id]\n"
                  "  spec-set <category> <spec-json>   # schema-as-data; validated by put/import-records\n"
+                 "\n"
+                 "export (JSONL to stdout):\n"
+                 "  export --preset edges   [--predicate /pred/calls] [--key-prefix P] [--limit N]\n"
+                 "  export --preset context [--key-prefix P] [--limit N] [--depth N] [--no-content]\n"
                  "\n"
                  "  seed\n"
                  "  version\n"
@@ -477,6 +482,19 @@ int main(int argc, char** argv) {
                 opts.count("meta") ? opts["meta"] : "{}", opts.count("content") ? opts["content"] : "{}",
                 opts.count("category") ? opts["category"] : "", opts.count("text") ? opts["text"] : "");
             std::cout << "{\"key\":\"" << key << "\"}\n";
+            return 0;
+        }
+        if (cmd == "export") {
+            ExportOptions eo;
+            eo.preset = opts.count("preset") ? opts["preset"] : "edges";
+            eo.predicate = opts.count("predicate") ? opts["predicate"] : "";
+            eo.key_prefix = opts.count("key-prefix") ? opts["key-prefix"] : "";
+            eo.limit = opts.count("limit") ? std::atol(opts["limit"].c_str()) : 1000;
+            eo.depth = opt_int("depth", 1);
+            eo.no_content = opts.count("no-content") > 0;
+            Db db(default_conninfo());
+            long n = export_corpus(db, eo);
+            std::cerr << "[EXPORT] " << n << " records\n";
             return 0;
         }
         if (cmd == "spec-set") {

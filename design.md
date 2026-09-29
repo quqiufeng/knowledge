@@ -423,6 +423,7 @@ design.md             # 本文档
 - [x] **调用图方向修复（重要）**：my_db `call_graph.json` 顶层键是 **callee**、`calls[].function` 是 **caller**（`file` 为 caller 文件）；此前 importer 读反了方向且把 caller 文件安到 callee 上。已修正为 `caller(精确自 file+name) -calls→ callee(按名解析)`。所有项目（redis/python/linux/linux70）重导并逐条对照源码验证（`__handle_mm_fault→handle_pte_fault→do_swap_page`、`hnsw_vectors_distance_bin→hnsw_popcount`）
 - [x] **调用图精度（歧义名跳过）**：callee 名（JSON 顶层，无文件）歧义时默认跳过，`--fanout` 可开启；Linux 7.1.2 边 157 万 → 90 万，linux70 56.3 万 → 38.7 万
 - [x] **context `--exclude-headers`**：过滤 `include/` 下的调用者/被调者（上游调用图把头文件宏误记为 caller，Linux 假边多源于此）；`do_swap_page` 的调用者过滤后全为真实 mm 函数
+- [x] **语料导出**：`export --preset edges|context` → 训练用 JSONL（带 provenance 与关系）
 - [x] **通用实体导入**：`import-records`（JSONL/CSV → 条目）
 - [x] **向量进 PG（pgvector）**：`embedding VECTOR(768)` + HNSW；`import-vectors`（含 bin/meta 名称校验）；`$knn` 算子（距离为主序）；`tools/embed_query.sh` + `qsearch`
 - [x] **检索统一**：`search` 默认 pgvector（`$knn` + `$fti` RRF），`--vector-cmd` 回退外挂；`source=pgvector+fti` / `vector+fti`
