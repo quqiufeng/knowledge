@@ -66,10 +66,11 @@ json_int_t jint(const json_t* o, const char* k) {
     return json_is_integer(v) ? json_integer_value(v) : 0;
 }
 
-std::string build_meta(const std::string& kind, const std::string& lang, const std::string& rel,
-                       json_int_t line, const std::string& name, const std::string& signature,
-                       bool stub = false) {
+std::string build_meta(const std::string& project, const std::string& kind, const std::string& lang,
+                       const std::string& rel, json_int_t line, const std::string& name,
+                       const std::string& signature, bool stub = false) {
     json_t* m = json_object();
+    json_object_set_new(m, "project", json_string(project.c_str()));
     json_object_set_new(m, "kind", json_string(kind.c_str()));
     json_object_set_new(m, "lang", json_string(lang.c_str()));
     json_object_set_new(m, "file", json_string(rel.c_str()));
@@ -305,8 +306,8 @@ void import_analysis(Db& db, const ImportOptions& opt) {
             }
             std::string rel = relpath_of(file, opt.root);
             std::string key = make_key(opt.project, rel, name);
-            std::string meta = build_meta(jstr(d, "kind"), jstr(d, "language"), rel, jint(d, "line_start"),
-                                          name, jstr(d, "signature"));
+            std::string meta = build_meta(opt.project, jstr(d, "kind"), jstr(d, "language"), rel,
+                                          jint(d, "line_start"), name, jstr(d, "signature"));
             std::string content = build_content(jstr(d, "content"), jstr(d, "docstring"));
             std::string terms = to_tsvector_text(tokenize_code(
                 name + " " + jstr(d, "signature") + " " + truncate_utf8(jstr(d, "content"), TOKENIZE_MAX)));
@@ -409,11 +410,11 @@ void import_analysis(Db& db, const ImportOptions& opt) {
     }
 
     for (const auto& [key, nf] : stub_funcs) {
-        add_knowledge(key, build_meta("function", "", nf.second, 0, nf.first, "", true), "{}",
+        add_knowledge(key, build_meta(opt.project, "function", "", nf.second, 0, nf.first, "", true), "{}",
                       to_tsvector_text(tokenize_code(nf.first)));
     }
     for (const auto& [key, name] : stub_vars) {
-        add_knowledge(key, build_meta("variable", "", "", 0, name, "", true), "{}",
+        add_knowledge(key, build_meta(opt.project, "variable", "", "", 0, name, "", true), "{}",
                       to_tsvector_text(tokenize_code(name)));
     }
     flush_k();

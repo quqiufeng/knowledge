@@ -119,7 +119,7 @@ AI 只产出**受限 JSON 表达式**，编译器翻译为参数化 SQL（安全
 
 | 前缀 | 含义 | 关键 meta |
 |---|---|---|
-| `/code/local/{project}/{relpath}/{symbol}` | 代码条目（函数/结构体/宏/头/文件） | `kind,lang,file,line,symbol,signature` |
+| `/code/local/{project}/{relpath}/{symbol}` | 代码条目（函数/结构体/宏/头/文件） | `project,kind,lang,file,line,symbol,signature` |
 | `/books/{book}/chapters/{chapter}/page_NNNN` | 电子书页 | `kind,book,chapter,page,file` |
 | `/data/{...}` | `import-records` 写入的任意记录 | `kind,source,<标量字段>` |
 | `/mem/{agent}/events|facts/...` | Agent 记忆 | `kind,agent,session,ts,tags,topic` |
@@ -155,7 +155,15 @@ echo '{"$where":{"$key":{"$prefix":"/code/local/linux/"}},"$group_by":"meta.kind
 # 或 JSE: {"$triple":{"object":"<key>","predicate":"/pred/calls","direction":"in"}}
 ```
 
-**D. 跨源**：不写 `$key` 前缀即可跨代码/电子书/记录一起检索（同一张图，可 join）。
+**D. 跨源 / 跨项目**
+- 不写 `$key` 前缀即可跨代码/电子书/记录一起检索（同一张图，可 join）。
+- 代码条目带 `meta.project`，可按项目聚合对比：
+```bash
+# 各项目的分配类函数数量
+echo '{"$where":{"$and":[{"$key":{"$prefix":"/code/local/"}},
+  {"$meta":{"path":"kind","$eq":"function"}},
+  {"$meta":{"path":"symbol","$ilike":"%alloc%"}}]},"$group_by":"meta.project"}' | ./knowledge query
+```
 
 **E. 导出训练语料（JSONL）**
 ```bash
