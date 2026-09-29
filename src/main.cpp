@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
             if (a.rfind("--", 0) == 0) {
                 std::string name = a.substr(2);
                 if (name == "skip-callgraph" || name == "skip-dataflow" || name == "no-code" ||
-                    name == "no-content" || name == "ro" || name == "force" || name == "fanout") {
+                    name == "no-content" || name == "ro" || name == "force" || name == "fanout" || name == "exclude-headers") {
                     opts[name] = "true";
                 } else if (i + 1 < argc) {
                     opts[name] = argv[++i];
@@ -311,7 +311,7 @@ int main(int argc, char** argv) {
             bool no_code = opts.count("no-code") > 0 || opts.count("no-content") > 0;
             long max_bytes = opts.count("max-code-bytes") ? std::atol(opts["max-code-bytes"].c_str()) : 0;
             Db db(default_conninfo());
-            json_t* r = api_context(db, pos[0], depth, k, pred, vector_cmd, no_code, max_bytes);
+            json_t* r = api_context(db, pos[0], depth, k, pred, vector_cmd, no_code, max_bytes, opts.count("exclude-headers") > 0);
             std::cout << json_dump(r, JSON_INDENT(2)) << std::endl;
             json_decref(r);
             return 0;

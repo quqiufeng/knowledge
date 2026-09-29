@@ -236,7 +236,8 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
 }
 
 json_t* api_context(Db& db, const std::string& key, int depth, int k, const std::string& pred_key,
-                    const std::string& vector_cmd, bool no_content, long max_bytes) {
+                    const std::string& vector_cmd, bool no_content, long max_bytes,
+                    bool exclude_headers) {
     json_t* bundle = json_object();
     json_object_set_new(bundle, "key", json_string(key.c_str()));
 
@@ -254,15 +255,16 @@ json_t* api_context(Db& db, const std::string& key, int depth, int k, const std:
     std::string id = json_string_value(json_object_get(json_array_get(idrows, 0), "id"));
     json_decref(idrows);
 
+    std::string hdr = exclude_headers ? " AND k.meta->>'file' NOT LIKE 'include/%'" : "";
     json_object_set_new(
         bundle, "callers",
         db.query_json("SELECT k.key, k.meta FROM statement st JOIN knowledge k ON k.id = st.subject_id "
-                      "WHERE st.object_id = $1::bigint AND st.is_active ORDER BY k.key",
+                      "WHERE st.object_id = $1::bigint AND st.is_active" + hdr + " ORDER BY k.key",
                       {id}));
     json_object_set_new(
         bundle, "callees",
         db.query_json("SELECT k.key, k.meta FROM statement st JOIN knowledge k ON k.id = st.object_id "
-                      "WHERE st.subject_id = $1::bigint AND st.is_active ORDER BY k.key",
+                      "WHERE st.subject_id = $1::bigint AND st.is_active" + hdr + " ORDER BY k.key",
                       {id}));
 
     if (depth > 0) {

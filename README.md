@@ -313,7 +313,9 @@ export KNOWLEDGE_VECTOR_CMD="./tools/vector_provider_books.sh"
 
 本项目是**上下文/证据供给层**（代码 + 电子书）：语料生成、微调等由外部系统负责，本项目只提供结构化上下文。
 
-### `knowledge context <key> [--depth N] [--k N] [--predicate <key>]`
+### `knowledge context <key> [--depth N] [--k N] [--predicate <key>] [--no-content] [--exclude-headers]`
+
+`--exclude-headers`：忽略调用者/被调者中位于 `include/` 的条目（Linux 下假边多源于头文件里的宏）。
 
 一次返回一个节点（代码符号 / 书籍页）的完整上下文包：
 

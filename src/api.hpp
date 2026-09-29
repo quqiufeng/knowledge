@@ -20,4 +20,5 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
 
 // Context bundle for a key. Returns a new json_t* (caller decrefs).
 json_t* api_context(Db& db, const std::string& key, int depth, int k, const std::string& pred_key,
-                    const std::string& vector_cmd, bool no_content, long max_bytes);
+                    const std::string& vector_cmd, bool no_content, long max_bytes,
+                    bool exclude_headers = false);
