@@ -157,11 +157,16 @@ long import_records(Db& db, const RecordsOptions& opt) {
             json_decref(rec);
         }
     } else {
+        auto strip_cr = [](std::string& s) {
+            if (!s.empty() && s.back() == '\r') s.pop_back();
+        };
         std::string header;
         if (!std::getline(in, header)) throw std::runtime_error("[RECORDS] empty csv");
+        strip_cr(header);
         std::vector<std::string> cols = parse_csv_line(header);
         std::string line;
         while (std::getline(in, line)) {
+            strip_cr(line);
             if (line.empty()) continue;
             std::vector<std::string> vals = parse_csv_line(line);
             json_t* rec = json_object();

@@ -85,6 +85,11 @@ rm -f "$noisy"
 
 recf=$(mktemp /tmp/rec.XXXXXX.jsonl)
 printf '{"key":"/data/smoke/k1","v":"hello world","n":1}\n' > "$recf"
+nin=$($BIN compile <<< '{"$where":{"$meta":{"path":"line","$in":[312,412]}},"$project":["key"]}' 2>&1)
+has '::numeric' "$nin" "numeric \$in casts text to numeric"
+out=$(echo '{"$where":{"$meta":{"path":"line","$in":[312,412]}},"$count":true}' | $BIN query 2>&1)
+if echo "$out" | grep -q '"error"'; then bad "numeric \$in query"; else ok "numeric \$in query"; fi
+
 n=$($BIN import-records "$recf" --kind smokerec 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('imported',''))" 2>/dev/null)
 [ "$n" = "1" ] && ok "import-records (jsonl -> entry)" || bad "import-records (got '$n')"
 rm -f "$recf"

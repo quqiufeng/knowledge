@@ -160,7 +160,8 @@ std::string compile_field(const std::string& expr, const json_t* meta, Ctx& ctx)
         }
         std::string lit = numeric ? pg_numeric_array(items) : pg_text_array(items);
         std::string cast = numeric ? "::numeric[]" : "::text[]";
-        std::string clause = expr + " = ANY(" + bind_param(ctx, lit) + cast + ")";
+        std::string lhs = numeric ? "(" + expr + ")::numeric" : expr;
+        std::string clause = lhs + " = ANY(" + bind_param(ctx, lit) + cast + ")";
         if (negated) clause = "NOT (" + clause + ")";
         clauses.push_back(clause);
     };
@@ -279,7 +280,7 @@ std::string compile_khop(const json_t* hop, Ctx& ctx, const std::string& alias) 
     std::string from_param = bind_param(ctx, json_string_value(from_v));
     std::string pred_param = bind_param(ctx, pg_text_array(preds));
 
-    std::vector<std::string> inner = {"c.depth > 0"};
+    std::vector<std::string> inner = {"c.depth > 0", "k.is_active"};
     const json_t* where = json_object_get(hop, "where");
     if (where) inner.push_back(compile_node(where, ctx, "k"));
 

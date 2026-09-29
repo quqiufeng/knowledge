@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <ctime>
+#include <unistd.h>
 #include <chrono>
 #include <stdexcept>
 #include <string>
@@ -38,7 +39,8 @@ std::string event_key(const std::string& agent) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch())
                   .count();
-    return "/mem/" + agent + "/events/" + std::to_string(ms) + "-" + std::to_string(seq++);
+    return "/mem/" + agent + "/events/" + std::to_string(ms) + "-" + std::to_string(getpid()) + "-" +
+           std::to_string(seq++);
 }
 
 std::string upsert_memory(Db& db, const std::string& key, const std::string& meta_json,

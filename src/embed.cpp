@@ -98,7 +98,9 @@ long import_vectors(Db& db, const EmbedOptions& opt) {
     // HNSW is expensive to maintain per row; for large loads drop and rebuild it.
     bool bulk = rows > 20000;
     if (bulk) db.exec("DROP INDEX IF EXISTS idx_knowledge_emb");
-    db.exec("UPDATE knowledge k SET embedding = v.vec::vector FROM stg_vec v WHERE k.key = v.key");
+    db.exec(
+        "UPDATE knowledge k SET embedding = v.vec::vector "
+        "FROM (SELECT DISTINCT ON (key) key, vec FROM stg_vec) v WHERE k.key = v.key");
     if (bulk)
         db.exec("CREATE INDEX idx_knowledge_emb ON knowledge USING hnsw (embedding vector_cosine_ops)");
     db.exec("DROP TABLE stg_vec");
