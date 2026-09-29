@@ -470,3 +470,23 @@ design.md             # 本文档
 - 原始路线分析：`prompts/context-brief.md`
 - 提问材料：`prompts/strike-1.md`、`strike-2.md`、`strike-3.md`
 - 快速上手：`README.md`
+
+---
+
+## 11. 修复记录（Bugfix Log）
+
+| 日期 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| 2026-09-29 | **严重** | 调用图**方向反了**：把 my_db `call_graph.json` 的顶层键（callee）当成 caller、`calls[].function`（caller）当成 callee，且把 caller 文件安到 callee 上 | 修正为 `caller(精确 file+name) -calls→ callee(按名解析)`；redis/python/linux/linux70 全部重导并对照源码验证 |
+| 2026-09-29 | 高 | 同名 callee（无文件）fan-out 造出大量假边 | 分歧名默认跳过，`--fanout` 可开启 |
+| 2026-09-29 | 中 | `$meta` 的 `$in`/`$nin` 数值分支：text 与 `numeric[]` 比较直接报错 | 数值时路径 `::numeric` |
+| 2026-09-29 | 中 | 查询**未注入** `AND is_active`（此前只是文档承诺） | 默认注入，`$include_archived` 关闭 |
+| 2026-09-29 | 中 | `$k-hop` 到达节点未校验 `is_active` | 内层加 `k.is_active` |
+| 2026-09-29 | 中 | 一个节点含多个算子被静默取第一个 | 强制"恰好一个算子" |
+| 2026-09-29 | 中 | `$knn` 与 `$order` 同现时距离排序被覆盖 | 距离恒为主序，`$order` 次之 |
+| 2026-09-29 | 低 | 记忆事件 key 跨进程同毫秒碰撞 | key 加入 pid |
+| 2026-09-29 | 低 | `import-vectors` 可能静默错位 | 校验 `.bin` 内 name 与 meta 一致，不符则跳过并告警 |
+| 2026-09-29 | 低 | `import-vectors` 更新时重复 key 不确定 | `DISTINCT ON (key)` |
+| 2026-09-29 | 低 | CSV 导入 CRLF 末列带 `\r` | 逐行 strip CR |
+| 2026-09-29 | 低 | Makefile 不跟踪头文件依赖，改头文件不重编导致链接错误 | `-MMD -MP` + `-include *.d` |
+| 2026-09-29 | 低 | `$search_score` / `$fti_rank` 缺前置算子时生成非法 SQL | 编译期显式报错 |
