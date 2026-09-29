@@ -108,18 +108,22 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
         json_decref(lq);
     }
 
+    // Weighted RRF: semantic is the primary signal for code search; lexical is a
+    // recall booster. Equal weights let lexical noise tie the correct vector hit.
     const double RRF_K = 60.0;
+    const double W_VEC = 1.0;
+    const double W_LEX = 0.5;
     std::unordered_map<std::string, double> rrf;
     std::unordered_map<std::string, int> vrank, lrank;
     std::unordered_map<std::string, double> vscore;
     for (size_t i = 0; i < hits.size(); ++i) {
-        rrf[hits[i].key] += 1.0 / (RRF_K + static_cast<double>(i + 1));
+        rrf[hits[i].key] += W_VEC / (RRF_K + static_cast<double>(i + 1));
         vrank[hits[i].key] = static_cast<int>(i + 1);
         vscore[hits[i].key] = hits[i].score;
     }
     for (size_t i = 0; i < lex_keys.size(); ++i) {
         const std::string& key = lex_keys[i];
-        rrf[key] += 1.0 / (RRF_K + static_cast<double>(i + 1));
+        rrf[key] += W_LEX / (RRF_K + static_cast<double>(i + 1));
         if (!lrank.count(key)) lrank[key] = static_cast<int>(i + 1);
     }
 
