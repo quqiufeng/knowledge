@@ -63,6 +63,9 @@ compiled=$(echo '{"$where":{"$meta":{"path":"lang","$eq":"c"}},"$group_by":"meta
 has 'GROUP BY' "$compiled" "\$group_by compiles to GROUP BY"
 compiled=$(echo '{"$where":{"$meta":{"path":"kind","$eq":"function"}},"$project":["key"],"$order":{"$in_degree":"desc"}}' | $BIN compile)
 has 'count(\*) FROM statement' "$compiled" "\$in_degree order compiles to degree subquery"
+compiled=$(echo '{"$where":{"$knn":{"vector":[0.1,0.2],"k":3}},"$project":["key"]}' | $BIN compile)
+has '<=>' "$compiled" "\$knn compiles to pgvector distance"
+has 'is_active' "$compiled" "active scope injected by default"
 
 hybrid=$($BIN search "alloc pages" --k 3 --vector-cmd ./tools/vector_provider_stub.sh 2>&1)
 has '"rrf"' "$hybrid" "hybrid search emits rrf score"
@@ -79,6 +82,12 @@ chmod +x "$noisy"
 out=$($BIN search "memory" --k 5 --vector-cmd "$noisy" 2>&1)
 has 'alloc_pages' "$out" "search tolerates noisy provider output"
 rm -f "$noisy"
+
+recf=$(mktemp /tmp/rec.XXXXXX.jsonl)
+printf '{"key":"/data/smoke/k1","v":"hello world","n":1}\n' > "$recf"
+n=$($BIN import-records "$recf" --kind smokerec 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('imported',''))" 2>/dev/null)
+[ "$n" = "1" ] && ok "import-records (jsonl -> entry)" || bad "import-records (got '$n')"
+rm -f "$recf"
 
 echo "[smoke] agent memory"
 mkey=$($BIN remember --agent smoke --text "smoke memory event" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('key',''))" 2>/dev/null)

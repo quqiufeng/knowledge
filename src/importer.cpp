@@ -437,6 +437,7 @@ void import_analysis(Db& db, const ImportOptions& opt) {
         "DROP INDEX IF EXISTS idx_knowledge_kind", "DROP INDEX IF EXISTS idx_knowledge_lang",
         "DROP INDEX IF EXISTS idx_knowledge_symbol", "DROP INDEX IF EXISTS idx_knowledge_file",
         "DROP INDEX IF EXISTS idx_knowledge_fti", "DROP INDEX IF EXISTS idx_knowledge_meta",
+        "DROP INDEX IF EXISTS idx_knowledge_emb",
         "DROP INDEX IF EXISTS idx_stmt_fwd", "DROP INDEX IF EXISTS idx_stmt_rev",
         "DROP INDEX IF EXISTS idx_stmt_pred",
     };
@@ -485,6 +486,7 @@ void import_analysis(Db& db, const ImportOptions& opt) {
             "CREATE INDEX idx_knowledge_file ON knowledge ((meta->>'file')) WHERE is_active",
             "CREATE INDEX idx_knowledge_fti ON knowledge USING GIN (search_tsv) WHERE is_active",
             "CREATE INDEX idx_knowledge_meta ON knowledge USING GIN (meta jsonb_path_ops) WHERE is_active",
+            "CREATE INDEX idx_knowledge_emb ON knowledge USING hnsw (embedding vector_cosine_ops)",
             "CREATE INDEX idx_stmt_fwd ON statement (subject_id, predicate_id, object_id) WHERE is_active",
             "CREATE INDEX idx_stmt_rev ON statement (object_id, predicate_id, subject_id) WHERE is_active",
             "CREATE INDEX idx_stmt_pred ON statement (predicate_id) WHERE is_active",

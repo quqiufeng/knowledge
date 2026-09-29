@@ -124,6 +124,8 @@ JSE 算子是 AI 与存储层之间的**契约**：存储引擎（PostgreSQL / �
 | 导入优化（流式 + 内存受限 + 大项目批量重建索引） | ✅ 完成 |
 | HTTP API（只读，连接池，共享知识库） | ✅ 完成 |
 | Agent 记忆（受控写 Action：remember/fact/link/forget） | ✅ 完成 |
+| 通用实体导入（JSONL/CSV → 条目） | ✅ 完成 |
+| 向量进 PG（pgvector + `$knn` + `qsearch`） | ✅ 完成 |
 | 多项目批量导入（16 仓库 / ~250 万 chunk） | 🚧 进行中 |
 | smoke test / 迁移对账 / 规范校验 / Action 层 | ⏳ 待办 |
 
@@ -156,6 +158,9 @@ src/compile.hpp/.cpp  # JSE 校验 + 编译器
 src/vector.hpp/.cpp   # 外挂向量引擎 provider 调用
 src/importer.hpp/.cpp # 代码知识导入器（chunks/call_graph/dataflow）
 src/books.hpp/.cpp    # 电子书导入器（/opt/books 的 Markdown）
+src/records.hpp/.cpp  # 通用实体导入（JSONL/CSV）
+src/embed.hpp/.cpp    # 向量入库（.bin -> knowledge.embedding）
+src/memory.hpp/.cpp   # Agent 记忆写 Action（remember/fact/link/forget）
 src/db.hpp/.cpp       # libpq 访问
 src/api.hpp/.cpp      # search / context 可复用实现（CLI 与 HTTP 共用）
 src/server.hpp/.cpp   # HTTP API 服务（只读，连接池）
@@ -164,6 +169,8 @@ third_party/httplib.h # vendored header-only HTTP 库（MIT）
 tools/ingest.sh               # 一键流水线：代码分析 + 入库
 tools/vector_provider.sh      # 代码向量引擎适配器（my_db cache_query）
 tools/vector_provider_books.sh# 电子书向量引擎适配器（my_db book cache）
+tools/vector_provider_books.sh# 电子书向量适配器
+tools/embed_query.sh          # 查询文本 -> 768 维向量（my_db Jina）
 tools/vector_provider_stub.sh # 测试用 stub
 prompts/              # 向 Google AI 提问的三弹材料 + 统一 brief
 design.md             # 技术设计文档 + 任务进度
@@ -353,6 +360,40 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 
 ---
 
+## 通用实体导入（不止代码/电子书）
+
+```bash
+# JSONL：每行一个对象
+./knowledge import-records notes.jsonl --text-field text --kind note
+# CSV：表头列名 -> meta/content
+./knowledge import-records people.csv --key-field id --prefix /data/person/ --kind person
+```
+
+- 任意结构化数据 → 条目；顶层标量字段进 `meta`（可 `$meta` 过滤），整条进 `content.value`
+  （或 `--text-field F` 时该字段作为 `content.text` 并参与全文）。
+- 至此"知识底座"不再只吃 my_db 产物，任何 JSONL/CSV 都能进库并统一查询。
+
+## 向量进 PG（pgvector）
+
+两种语义检索模式并存，可任选：
+
+| 模式 | 说明 |
+|---|---|
+| 外挂引擎（provider） | 沿用 my_db `.hnsw`，零导入 |
+| **PG 内（pgvector）** | `import-vectors` 把 `.bin` 向量灌进 `knowledge.embedding`，HNSW + 余弦距离 KNN，**与标量/图过滤同一条 SQL** |
+
+```bash
+./knowledge import-vectors --analysis-dir /opt/code_caches/redis_cache --project redis --root /opt/redis
+./knowledge qsearch "memory pool allocation" --k 5
+./knowledge qsearch "memory pool allocation" --k 5 --where '{"$meta":{"path":"file","$prefix":"src/"}}'
+```
+
+- `$knn` 算子：`{"$knn":{"vector":[...],"k":N}}` → `ORDER BY embedding <=> $vec`。
+- 查询文本→向量：`tools/embed_query.sh`（复用 my_db Jina 模型，GPU）。
+- 实测：redis 10658 向量入库，qsearch 结果与外挂引擎一致（`RM_PoolAlloc` 等）。
+
+---
+
 ## HTTP API（只读）
 
 查询层无状态、状态在 PG，因此天然支持多调用方共享一个知识库。服务只读：写/改/删只在本地导入。
@@ -388,6 +429,15 @@ curl -s -G 'localhost:8931/context' --data-urlencode 'key=/code/local/redis/src/
 
 限制：请求体 ≤ 1MB、每请求 `statement_timeout=30s`、`$limit` ≤ 1000、`$k-hop` depth ≤ 5；
 只读角色在数据库层禁止任何写操作。
+
+### 写侧安全：局域网 SSH + key（推荐）
+
+远程写**不开放 HTTP**，而是用 **SSH + 公钥** 在局域网内执行本地 CLI：
+
+- 认证/加密/授权交给 SSH，不自造 auth；
+- DB 写角色只监听 localhost，SSH 即使泄露也拿不到 DB 凭据；
+- 可用 `authorized_keys` 的 `command=` 强制命令（限定某 key 只能跑 `knowledge`）、`no-pty`、`from=` 限制来源；
+- 读走只读 HTTP（无信任要求），写走 SSH（有信任要求）。
 
 ---
 

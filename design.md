@@ -305,6 +305,22 @@ Agent 把本库当长期记忆。写入是**受控 Action**（本地 CLI），�
 - **历史是一等数据**：覆盖即归档，可回溯。
 - **口径注入**：查询默认 `AND is_active`（`$include_archived:true` 关闭）。
 
+### 5.7 通用实体导入
+
+`knowledge import-records <file> [--format jsonl|csv] [--key-field key] [--kind K] [--text-field F] [--prefix P]`：
+把任意 JSONL/CSV 记录转为条目。顶层标量字段进 `meta`（可过滤），整条进 `content.value`
+（或 `--text-field` 时该字段作 `content.text` 并走全文）。使底座不再只限于 my_db 产物。
+
+### 5.8 向量进 PG（pgvector）
+
+两种语义检索并存：
+
+- 外挂 provider：沿用 my_db `.hnsw`（零导入）。
+- **pgvector**：`embedding VECTOR(768)` 列 + HNSW（`vector_cosine_ops`）。`import-vectors` 按
+  `chunks_meta.jsonl` 与 `.bin` 顺序对齐灌入；`$knn` 算子编译为 `embedding <=> $vec::vector`，
+  与标量/图过滤在**同一条 SQL**；`qsearch` 用 `tools/embed_query.sh`（复用 Jina 模型）把查询文本转向量。
+- 已实测：redis 10658 向量，`qsearch` 与外挂引擎结果一致。
+
 ## 6. 安全模型
 
 | 风险 | 对策 |
@@ -314,6 +330,7 @@ Agent 把本库当长期记忆。写入是**受控 Action**（本地 CLI），�
 | 任意 SQL | AI 只能产出受限 AST；编译器只生成参数化 SELECT |
 | 口径绕过 | `is_active` 在编译期注入，partial index 与之一致 |
 | 谓词硬编码 | 谓词以 key 表示，编译期经 `knowledge` 表解析为 `predicate_id` |
+| 远程写 | 写不开放 HTTP；局域网内 **SSH + 公钥** 执行本地 CLI（可 `command=`/`no-pty`/`from=` 限定）；DB 写角色仅 localhost |
 
 ---
 
@@ -393,6 +410,8 @@ design.md             # 本文档
 
 - [x] **Agent 记忆（Action 层，本地）**：`remember`/`fact`/`link`/`forget`；情景事件 + 键值事实；覆盖即归档（`/@archive` + `/pred/supersedes`）；`/mem/{agent}` 命名空间；provenance 自动注入
 - [x] **口径注入修复**：查询默认 `AND is_active`（此前只是文档承诺未实现），`$include_archived` 可关闭
+- [x] **通用实体导入**：`import-records`（JSONL/CSV → 条目）
+- [x] **向量进 PG（pgvector）**：`embedding VECTOR(768)` + HNSW；`import-vectors`；`$knn` 算子；`tools/embed_query.sh` + `qsearch`（redis 实测与外挂引擎一致）
 
 ### 进行中 🚧
 
@@ -422,7 +441,7 @@ design.md             # 本文档
 | 1 | 三元组端点用 BIGINT 代理键 | 千万级下索引缩小 60-70%、整数比较快 2-5x | TEXT key 易超长、索引膨胀、重构需级联 |
 | 2 | `is_active` 生成列（不含时间函数） | IMMUTABLE 才能做生成列；谓词与索引一致 | 含 `now()` 的生成列在 PG 非法 |
 | 3 | `key` 全表唯一（非 partial） | FK 引用目标 + 逻辑身份 | partial unique 不能作 FK 目标 |
-| 4 | 向量外挂、不入 PG | 沿用现有 HNSW、PG 只存标量 | pgvector 更新/删除语义与迁移成本 |
+| 4 | 向量：外挂 provider 与 pgvector **并存** | 外挂零导入；pgvector 让向量与标量/图同一条 SQL、同事务 | 单一方案都被否决 |
 | 5 | 全文应用层预分词 + `search_tsv` | 代码标识符默认分词器命中差；通用可移植 | pg_search/BM25 引入第三方扩展 |
 | 6 | 编译器用 C++17 + libpq + jansson | 可编译为单文件二进制、与 my_db 工具链一致、无运行时依赖 | TypeScript（需 Node/Bun 运行时）、Go |
 | 7 | `$k-hop` 用递归 CTE（ID 拓扑） | 免引入图数据库；写侧实时更新友好 | ltree（树限制，无法表达 DAG/环）、物化闭包表（维护成本高） |

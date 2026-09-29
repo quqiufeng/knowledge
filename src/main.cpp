@@ -3,8 +3,13 @@
 #include "compile.hpp"
 #include "db.hpp"
 #include "importer.hpp"
+#include "embed.hpp"
 #include "memory.hpp"
+#include "records.hpp"
 #include "server.hpp"
+
+#include <cstdio>
+#include <filesystem>
 #include "tokenize.hpp"
 
 #include <jansson.h>
@@ -140,6 +145,28 @@ std::string env_or(const char* name, const std::string& fallback) {
     return (v && *v) ? std::string(v) : fallback;
 }
 
+std::string sh_quote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+std::string run_cmd(const std::string& cmd) {
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) throw std::runtime_error("[CMD] popen failed");
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
+    int rc = pclose(p);
+    if (rc != 0 && out.empty()) throw std::runtime_error("[CMD] command failed: " + cmd);
+    return out;
+}
+
 void split_csv(const std::string& s, std::vector<std::string>& out) {
     size_t start = 0;
     while (start <= s.size()) {
@@ -162,6 +189,10 @@ int usage() {
                  "  import   --analysis-dir <dir> --project <p> --root <r>\n"
                  "           [--limit N] [--skip-callgraph] [--skip-dataflow]\n"
                  "  import-books [--books-dir <dir>] [--book <name>] [--limit N]\n"
+                 "  import-records <file> [--format jsonl|csv] [--key-field key] [--kind K]\n"
+                 "                 [--text-field F] [--prefix /data/]\n"
+                 "  import-vectors --project <p> --root <r> (--analysis-dir <d> | --bin <f> --meta <f>)\n"
+                 "  qsearch  <query> [--k N] [--where <jse>] [--embed-cmd <cmd>]\n"
                  "  serve    [--port N] [--bind <addr>] [--pool N] [--ro] [--vector-cmd <cmd>]\n"
                  "\n"
                  "agent memory (local actions; write role):\n"
@@ -287,6 +318,82 @@ int main(int argc, char** argv) {
                               : default_conninfo();
             so.vector_cmd = vector_cmd;
             return run_server(so);
+        }
+        if (cmd == "import-vectors") {
+            EmbedOptions eo;
+            eo.project = opts.count("project") ? opts["project"] : "";
+            eo.root = opts.count("root") ? opts["root"] : "";
+            eo.limit = opts.count("limit") ? std::atol(opts["limit"].c_str()) : 0;
+            if (opts.count("analysis-dir")) {
+                std::string dir = opts["analysis-dir"];
+                eo.meta_file = dir + "/chunks_meta.jsonl";
+                std::error_code ec;
+                for (const auto& e : std::filesystem::directory_iterator(dir + "/vectors", ec)) {
+                    if (e.path().extension() == ".bin") {
+                        eo.bin_file = e.path().string();
+                        break;
+                    }
+                }
+            }
+            if (opts.count("bin")) eo.bin_file = opts["bin"];
+            if (opts.count("meta")) eo.meta_file = opts["meta"];
+            Db db(default_conninfo());
+            long n = import_vectors(db, eo);
+            std::cout << "{\"vectors\":" << n << "}\n";
+            return 0;
+        }
+        if (cmd == "qsearch") {
+            if (pos.empty()) return usage();
+            int k = opt_int("k", 10);
+            std::string where = opts.count("where") ? opts["where"] : "";
+            std::string embed_cmd =
+                opts.count("embed-cmd") ? opts["embed-cmd"] : env_or("KNOWLEDGE_EMBED_CMD", "./tools/embed_query.sh");
+            std::string vec = run_cmd(embed_cmd + " " + sh_quote(pos[0]));
+            json_t* vecarr = json_loads(vec.c_str(), 0, nullptr);
+            if (!json_is_array(vecarr)) {
+                if (vecarr) json_decref(vecarr);
+                throw std::runtime_error("[QSEARCH] embedding failed (no vector)");
+            }
+            json_t* knn = json_object();
+            json_object_set_new(knn, "vector", json_incref(vecarr));
+            json_object_set_new(knn, "k", json_integer(k));
+            json_t* knn_node = json_object();
+            json_object_set_new(knn_node, "$knn", knn);
+            json_t* and_arr = json_array();
+            json_array_append_new(and_arr, knn_node);
+            if (!where.empty()) {
+                json_t* extra = json_loads(where.c_str(), 0, nullptr);
+                if (!extra) throw std::runtime_error("[QSEARCH] invalid --where JSE");
+                json_array_append_new(and_arr, extra);
+            }
+            json_t* inner = json_object();
+            json_object_set_new(inner, "$and", and_arr);
+            json_t* q = json_object();
+            json_object_set_new(q, "$where", inner);
+            json_t* proj = json_array();
+            for (const char* p : {"key", "meta.symbol", "meta.file", "meta.line", "meta.signature"})
+                json_array_append_new(proj, json_string(p));
+            json_object_set_new(q, "$project", proj);
+            json_object_set_new(q, "$limit", json_integer(k));
+            Db db(default_conninfo());
+            run_query(db, q, {}, true);
+            json_decref(q);
+            json_decref(vecarr);
+            return 0;
+        }
+        if (cmd == "import-records") {
+            if (pos.empty()) return usage();
+            RecordsOptions ro;
+            ro.file = pos[0];
+            ro.format = opts.count("format") ? opts["format"] : "";
+            ro.key_field = opts.count("key-field") ? opts["key-field"] : "key";
+            ro.kind = opts.count("kind") ? opts["kind"] : "record";
+            ro.text_field = opts.count("text-field") ? opts["text-field"] : "";
+            ro.prefix = opts.count("prefix") ? opts["prefix"] : "";
+            Db db(default_conninfo());
+            long n = import_records(db, ro);
+            std::cout << "{\"imported\":" << n << "}\n";
+            return 0;
         }
         if (cmd == "remember") {
             std::vector<std::string> about, tags;

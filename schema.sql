@@ -4,6 +4,8 @@
 
 BEGIN;
 
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- ============================================================
 -- 信息条目表：代码 chunk、类/函数节点、规范文件、谓词定义等一切节点
 -- ============================================================
@@ -12,6 +14,7 @@ CREATE TABLE knowledge (
     key           TEXT UNIQUE NOT NULL,          -- 逻辑身份 + FK 引用目标（全表唯一）
     meta          JSONB NOT NULL DEFAULT '{}'::jsonb,   -- {kind,lang,file,line,symbol,...}
     content       JSONB NOT NULL DEFAULT '{}'::jsonb,   -- 代码/正文
+    embedding     VECTOR(768),                   -- 语义向量（pgvector，可选）
     search_tsv    TSVECTOR,                      -- 应用层分词器预计算（simple config）
     version       BIGINT NOT NULL DEFAULT 0,     -- 乐观锁
     start_time    TIMESTAMPTZ,
@@ -73,5 +76,9 @@ CREATE INDEX idx_knowledge_fti
 CREATE INDEX idx_knowledge_meta
     ON knowledge USING GIN (meta jsonb_path_ops)
     WHERE is_active;
+
+-- 语义向量（pgvector HNSW，余弦距离）
+CREATE INDEX idx_knowledge_emb
+    ON knowledge USING hnsw (embedding vector_cosine_ops);
 
 COMMIT;

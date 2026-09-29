@@ -24,6 +24,8 @@ struct Ctx {
     std::vector<std::string> params;
     bool has_search{false};
     std::string fti_tsq;
+    std::string knn_order;
+    long knn_k{0};
     const std::function<bool(const std::string&, long long&)>* resolve_key{nullptr};
 };
 
@@ -303,7 +305,7 @@ std::string compile_khop(const json_t* hop, Ctx& ctx, const std::string& alias) 
 std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias) {
     if (!json_is_object(node)) throw std::runtime_error("[JSE] node must be an object");
 
-    static const char* op_keys[] = {"$and", "$or", "$not", "$meta", "$key", "$fti", "$search", "$triple", "$k-hop"};
+    static const char* op_keys[] = {"$and", "$or", "$not", "$meta", "$key", "$fti", "$search", "$knn", "$triple", "$k-hop"};
     int present = 0;
     for (const char* k : op_keys) {
         if (json_object_get(node, k)) present++;
@@ -350,6 +352,27 @@ std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias)
     if (json_object_get(node, "$search")) {
         if (!ctx.has_search) throw std::runtime_error("[JSE] $search requires external vector results");
         return "(EXISTS (SELECT 1 FROM vs WHERE vs.key = " + alias + ".key))";
+    }
+    if (const json_t* v = json_object_get(node, "$knn")) {
+        require_object(v, "$knn");
+        const json_t* vec = json_object_get(v, "vector");
+        if (!json_is_array(vec) || json_array_size(vec) == 0)
+            throw std::runtime_error("[JSE] $knn requires non-empty 'vector' array");
+        std::string lit = "[";
+        for (size_t i = 0; i < json_array_size(vec); ++i) {
+            const json_t* e = json_array_get(vec, i);
+            if (!json_is_number(e)) throw std::runtime_error("[JSE] $knn vector must be numbers");
+            char b[40];
+            std::snprintf(b, sizeof(b), "%.8g", json_number_value(e));
+            if (i) lit += ",";
+            lit += b;
+        }
+        lit += "]";
+        std::string param = bind_param(ctx, lit);
+        ctx.knn_order = alias + ".embedding <=> " + param + "::vector";
+        const json_t* k = json_object_get(v, "k");
+        if (json_is_integer(k)) ctx.knn_k = static_cast<long>(json_integer_value(k));
+        return "(" + alias + ".embedding IS NOT NULL)";
     }
     if (const json_t* v = json_object_get(node, "$triple")) {
         require_object(v, "$triple");
@@ -491,12 +514,20 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
         }
     }
 
+    bool knn_needs_limit = false;
+    if (order_sql.empty() && !ctx.knn_order.empty()) {
+        order_sql = " ORDER BY " + ctx.knn_order + " ASC";
+        knn_needs_limit = true;
+    }
+
     json_int_t limit = 100;
     const json_t* limit_v = json_object_get(query, "$limit");
     if (json_is_integer(limit_v)) {
         limit = json_integer_value(limit_v);
         if (limit < 1) limit = 1;
         if (limit > 1000) limit = 1000;
+    } else if (knn_needs_limit && ctx.knn_k > 0) {
+        limit = ctx.knn_k;
     }
     std::string offset_sql;
     const json_t* offset_v = json_object_get(query, "$offset");
