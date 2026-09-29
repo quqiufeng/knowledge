@@ -74,6 +74,8 @@ JSE 算子是 AI 与存储层之间的**契约**：存储引擎（PostgreSQL / �
 | token 友好输出（嵌套 meta/content + 字段裁剪 + `--no-content`） | ✅ 完成 |
 | 混合检索（向量 + 全文 RRF 融合） | ✅ 完成 |
 | 编译期 key→id 解析、`$k-hop` 结果上限、回归测试 | ✅ 完成 |
+| 导入优化（流式 + 内存受限 + 大项目批量重建索引） | ✅ 完成 |
+| HTTP API（只读，连接池，共享知识库） | ✅ 完成 |
 | 多项目批量导入（16 仓库 / ~250 万 chunk） | 🚧 进行中 |
 | smoke test / 迁移对账 / 规范校验 / Action 层 | ⏳ 待办 |
 
@@ -107,7 +109,10 @@ src/vector.hpp/.cpp   # 外挂向量引擎 provider 调用
 src/importer.hpp/.cpp # 代码知识导入器（chunks/call_graph/dataflow）
 src/books.hpp/.cpp    # 电子书导入器（/opt/books 的 Markdown）
 src/db.hpp/.cpp       # libpq 访问
-src/main.cpp          # CLI（tokenize/compile/query/search/context/import/import-books/seed）
+src/api.hpp/.cpp      # search / context 可复用实现（CLI 与 HTTP 共用）
+src/server.hpp/.cpp   # HTTP API 服务（只读，连接池）
+src/main.cpp          # CLI（tokenize/compile/query/search/context/import/import-books/serve/seed）
+third_party/httplib.h # vendored header-only HTTP 库（MIT）
 tools/ingest.sh               # 一键流水线：代码分析 + 入库
 tools/vector_provider.sh      # 代码向量引擎适配器（my_db cache_query）
 tools/vector_provider_books.sh# 电子书向量引擎适配器（my_db book cache）
@@ -297,6 +302,44 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 电子书用 `tools/vector_provider_books.sh`（`BOOK_CACHE=/book/cache`），`cache_query` 返回的 `name` 直接就是 page key，无需映射。
 
 > 说明：`related` / `search` 要命中，PG 中必须有同 key 的条目（即先跑导入器）。当前 `seed` 只灌了少量演示数据。
+
+---
+
+## HTTP API（只读）
+
+查询层无状态、状态在 PG，因此天然支持多调用方共享一个知识库。服务只读：写/改/删只在本地导入。
+
+```bash
+# 准备只读角色（首次，本地执行）
+sudo -u postgres psql -c "CREATE ROLE knowledge_ro LOGIN PASSWORD 'knowledge_ro';"
+sudo -u postgres psql -d knowledge -c \
+  "GRANT CONNECT ON DATABASE knowledge TO knowledge_ro;
+   GRANT USAGE ON SCHEMA public TO knowledge_ro;
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO knowledge_ro;
+   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO knowledge_ro;"
+
+# 启动（默认 127.0.0.1:8931，连接池 4）
+./knowledge serve --port 8931 --ro
+export KNOWLEDGE_VECTOR_CMD=./tools/vector_provider.sh
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /health` | `{"status":"ok"}` |
+| `GET /stats` | knowledge / statement / active 计数 |
+| `POST /jse` | body 为 JSE 查询（可带 `"$vectors":[...]` 供 `$search`） |
+| `GET /search?q=&k=&where=` | 混合检索 |
+| `GET /context?key=&depth=&k=&predicate=&no_content=&max_code_bytes=` | 上下文包 |
+
+```bash
+curl -s -X POST localhost:8931/jse \
+  -d '{"$where":{"$and":[{"$meta":{"path":"kind","$eq":"function"}},{"$fti":"zmalloc"}]},"$project":["key","meta.symbol"],"$limit":5}'
+curl -s 'localhost:8931/search?q=memory%20pool&k=5'
+curl -s -G 'localhost:8931/context' --data-urlencode 'key=/code/local/redis/src/module.c/RM_PoolAlloc' --data 'depth=2'
+```
+
+限制：请求体 ≤ 1MB、每请求 `statement_timeout=30s`、`$limit` ≤ 1000、`$k-hop` depth ≤ 5；
+只读角色在数据库层禁止任何写操作。
 
 ---
 

@@ -248,6 +248,24 @@ C++ 侧 `src/vector.cpp` 用 `popen` 调用并解析，结果喂给 `compile_que
 结果附带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`，便于判断命中来源与调试。
 RRF 让"向量召回但全文未命中"与"全文精确但向量偏离"两类结果互补，优于单一排序。
 
+### 5.5 HTTP API（只读）
+
+查询层无状态（`compile_query` 是纯函数），状态全在 PG，因此天然支持多调用方共享同一知识库。
+`knowledge serve` 用 vendored 的 `cpp-httplib`（header-only）暴露只读接口：
+
+| 端点 | 实现 |
+|---|---|
+| `GET /health` | 存活 |
+| `GET /stats` | 计数 |
+| `POST /jse` | JSE 编译 + 执行（body 可带 `$vectors` 供 `$search`） |
+| `GET /search` | `api_search`（RRF） |
+| `GET /context` | `api_context` |
+
+- **连接池**：libpq 连接非线程安全 → `Pool` 维护 N 个连接，租借/归还；PG 侧并发。
+- **只读**：服务以 `knowledge_ro`（仅 SELECT）连接；写/改/删只在本地导入。API 层不含写接口。
+- **限额**：请求体 ≤ 1MB、`statement_timeout=30s`、`$limit ≤ 1000`、`$k-hop depth ≤ 5`。
+- `search` / `context` 逻辑抽到 `src/api.cpp`，CLI 与 HTTP 共用，避免两套实现漂移。
+
 ---
 
 ## 6. 安全模型
@@ -271,6 +289,8 @@ src/
   util.hpp            # 公共工具（COPY 转义 / relpath / UTF-8 截断）
   tokenize.hpp/.cpp   # 代码标识符分词器
   compile.hpp/.cpp    # JSE 校验 + 编译器（jansson + 参数化 SQL）
+  api.hpp/.cpp        # search / context 复用实现（CLI + HTTP）
+  server.hpp/.cpp     # HTTP API 服务（只读，连接池）
   vector.hpp/.cpp     # 外挂向量引擎 provider 调用
   importer.hpp/.cpp   # 代码知识导入器（chunks/call_graph/dataflow）
   books.hpp/.cpp      # 电子书导入器（/opt/books 的 Markdown）
@@ -328,6 +348,7 @@ design.md             # 本文档
       - DB 载入：`array_to_tsvector`（免二次解析）替代 `to_tsvector`
       - 大项目（>20 万行）自动「丢索引/FK → 批量重建」，小项目保持增量（避免固定重建开销）
       - 结果：290s → 200s（chunks 67s / knowledge insert 67s / statement 15s / 索引重建 39s）
+- [x] **HTTP API（只读）**：`knowledge serve`（cpp-httplib + 连接池），端点 `/health` `/stats` `/jse` `/search` `/context`；服务端用 `knowledge_ro` 只读角色，写路径仅本地；请求体/超时/深度限额；`tests/smoke.sh` 覆盖
 
 ### 进行中 🚧
 

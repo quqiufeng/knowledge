@@ -69,5 +69,19 @@ out=$($BIN search "memory" --k 5 --vector-cmd "$noisy" 2>&1)
 has 'alloc_pages' "$out" "search tolerates noisy provider output"
 rm -f "$noisy"
 
+echo "[smoke] http api"
+if command -v curl >/dev/null 2>&1; then
+    $BIN serve --port 8799 --ro --pool 2 >/tmp/ksrv.log 2>&1 &
+    SPID=$!
+    sleep 1
+    has '"ok"' "$(curl -s localhost:8799/health)" "GET /health"
+    has 'knowledge' "$(curl -s localhost:8799/stats)" "GET /stats"
+    has '"key"' "$(curl -s -X POST localhost:8799/jse -d '{"$where":{"$fti":"zmalloc"},"$project":["key"],"$limit":1}')" "POST /jse"
+    kill $SPID 2>/dev/null
+    wait $SPID 2>/dev/null
+else
+    echo "  SKIP - curl not found"
+fi
+
 echo "[smoke] $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
