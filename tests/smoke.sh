@@ -57,6 +57,12 @@ compiled=$(echo '{"$where":{"$meta":{"path":"file","$prefix":"mm/"}},"$project":
 has 'LIKE' "$compiled" "\$prefix compiles to LIKE"
 compiled=$(echo '{"$where":{"$meta":{"path":"symbol","$ilike":"%alloc%"}},"$count":true}' | $BIN compile)
 has 'count(\*)' "$compiled" "\$count compiles to count(*)"
+compiled=$(echo '{"$where":{"$key":{"$prefix":"/code/local/mem/"}},"$project":["key"]}' | $BIN compile)
+has 'knowledge.key LIKE' "$compiled" "\$key compiles to key LIKE"
+compiled=$(echo '{"$where":{"$meta":{"path":"lang","$eq":"c"}},"$group_by":"meta.file"}' | $BIN compile)
+has 'GROUP BY' "$compiled" "\$group_by compiles to GROUP BY"
+compiled=$(echo '{"$where":{"$meta":{"path":"kind","$eq":"function"}},"$project":["key"],"$order":{"$in_degree":"desc"}}' | $BIN compile)
+has 'count(\*) FROM statement' "$compiled" "\$in_degree order compiles to degree subquery"
 
 hybrid=$($BIN search "alloc pages" --k 3 --vector-cmd ./tools/vector_provider_stub.sh 2>&1)
 has '"rrf"' "$hybrid" "hybrid search emits rrf score"

@@ -1,8 +1,20 @@
 # Knowledge
 
-数据库版**知识检索**系统：把代码仓库索引语料（chunk / 调用图 / 数据流）与电子书等文本归一为「条目 + 三元组」，用受控的 **JSE（JSON S-Expression）** 查询语言供 AI Agent 安全访问。
+**可查询的知识底座**：把代码、电子书等异构语料归一为「条目 + 三元组」，用受控的 **JSE（JSON S-Expression）** 查询语言提供**语义 + 全文 + 图 + 聚合**的一体化查询。**code search 是它的第一个应用，不是全部。**
 
 支持两类输入源：**代码仓库**（my_db `code_indexer` 产物）与**电子书**（my_db `import_book` 产物）。
+
+## 能承载什么（不止 code search）
+
+底层是关系化、可组合、可共享、可持久化的知识底座，因此可用于：
+
+1. **Agent 的长期记忆 / 事实源**：多 Agent 共享、可追溯、可演化（只读 HTTP API）。
+2. **跨域知识图谱**：代码 + 文档 + 笔记 + 业务实体，靠三元组连成一张图，可 join。
+3. **语料 / 训练数据证据层**：带 provenance、关系、版本的结构化语料。
+4. **规则 / 规范 / 本体**：规范本身是条目（schema-as-data），与事实同库。
+5. **受控写（Action 层，规划中）**：在同一底座上做可审计的业务变更。
+
+PG 底座独有的能力（相对文件/内存索引）：关系是一等数据、组合+聚合查询、时间维度（版本/生效期/审计）、多调用方共享、JSONB/GIN/全文/生态、规范化事实层。
 
 ---
 
@@ -382,12 +394,13 @@ curl -s -G 'localhost:8931/context' --data-urlencode 'key=/code/local/redis/src/
 
 - `$and` / `$or` / `$not`
 - `$meta`：`path` + `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$like/$ilike/$prefix`
+- `$key`：对条目 `key` 施加与 `$meta` 相同的运算符（如按项目前缀 `/code/local/linux70/` 过滤）
 - `$fti`：全文（应用层分词，OR 语义）
 - `$search`：向量（外挂引擎提供 `vectors` 候选，按 `$search_score` 排序）
 - `$triple`：`subject` / `predicate` / `object` 边匹配；`direction`（`out` 沿指定 subject 的出边 / `in` 入边 / `both` 默认两端）
 - `$k-hop`：`from` / `predicates` / `depth` / `direction` / `where`，ID 拓扑遍历 + path 防环
-- 排序键：`$search_score`（需 `$search`）、`$fti_rank`（需 `$fti`，用 `ts_rank`）
-- 聚合：`$count: true`（返回匹配总数）
+- 排序键：`$search_score`（需 `$search`）、`$fti_rank`（需 `$fti`）、`$in_degree` / `$out_degree`（按边度数）
+- 聚合：`$count: true`（匹配总数）、`$group_by: "<path>"`（分组计数，按 count 降序）
 - 修饰符：`$project` / `$order` / `$limit` / `$offset`
 
 ### 路径约定

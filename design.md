@@ -1,6 +1,6 @@
 # Knowledge — 技术设计文档（design.md）
 
-> 数据库版**知识检索**系统：把代码仓库索引语料与电子书文本归一为「条目 + 三元组」，用受控的 JSE 查询语言供 AI Agent 安全访问。
+> **可查询的知识底座**：把代码、电子书等异构语料归一为「条目 + 三元组」，用受控的 JSE 查询语言提供 语义+全文+图+聚合 的一体化查询。**code search 是它的第一个应用，不是全部。**
 > 本文记录技术架构、关键决策与任务进度。更新于 2026-09-29。
 
 ---
@@ -263,9 +263,11 @@ RRF 让"向量召回但全文未命中"与"全文精确但向量偏离"两类结
 ### 5.4.1 查询算子扩充
 
 - `$meta` 增加 `$like` / `$ilike` / `$prefix`：路径/符号的前缀与模糊匹配（值仍走参数绑定）。
+- `$key`：对条目 `key` 施加同一组运算符（按项目/路径前缀过滤）。
 - `$count: true`：返回匹配总数（聚合）。
+- `$group_by: "<path>"`：分组计数，按 count 降序（如 `meta.file` → 文件函数数）。
+- 排序键 `$in_degree` / `$out_degree`：按边度数排序（"被调用最多的函数"）。
 - 已知 key 在编译期解析为整数 id（`resolve_key`），省去每个条件的子查询。
-- 缺口：尚无 `$group by` 与「按度数排序」——目前"调用者最多的函数"只能写裸 SQL。
 
 ### 5.5 HTTP API（只读）
 
@@ -367,7 +369,9 @@ design.md             # 本文档
       - DB 载入：`array_to_tsvector`（免二次解析）替代 `to_tsvector`
       - 大项目（>20 万行）自动「丢索引/FK → 批量重建」，小项目保持增量（避免固定重建开销）
       - 结果：290s → 200s（chunks 67s / knowledge insert 67s / statement 15s / 索引重建 39s）
-- [x] **查询算子扩充**：`$meta` 的 `$like/$ilike/$prefix`；`$count` 聚合；Linux 数据对齐（用当前 `call_graph` 重建 linux70 图，563410 边，图与向量同源）
+- [x] **查询算子扩充（分析型）**：`$key`、`$group_by`、`$count`、度数排序 `$in_degree`/`$out_degree`、`$meta` 的 `$like/$ilike/$prefix`。已可表达"调用者最多的函数""文件函数数分布"等分析查询
+- [x] **Linux 数据对齐**：用当前 `call_graph` 重建 linux70 图（54M / 219582 函数，563410 边），图与向量同源
+- [x] **文档重新定位**：从"code search 系统"改为"可查询知识底座（code search 为首个应用）"
 - [x] **search 加权 RRF**：向量 1.0 / 全文 0.5（修复纯语义查询被全文噪声并列）
 - [x] **HTTP API（只读）**：`knowledge serve`（cpp-httplib + 连接池），端点 `/health` `/stats` `/jse` `/search` `/context`；服务端用 `knowledge_ro` 只读角色，写路径仅本地；请求体/超时/深度限额；`tests/smoke.sh` 覆盖
 

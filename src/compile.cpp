@@ -110,11 +110,7 @@ std::string pg_numeric_array(const std::vector<std::string>& items) {
 
 std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias);
 
-std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias) {
-    const json_t* path_v = json_object_get(meta, "path");
-    if (!json_is_string(path_v)) throw std::runtime_error("[JSE] $meta requires string 'path'");
-    std::string expr = json_path_expr(alias, "meta", json_string_value(path_v));
-
+std::string compile_field(const std::string& expr, const json_t* meta, Ctx& ctx) {
     std::vector<std::string> clauses;
 
     const json_t* v = json_object_get(meta, "$eq");
@@ -199,6 +195,12 @@ std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias)
     }
     out += ")";
     return out;
+}
+
+std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias) {
+    const json_t* path_v = json_object_get(meta, "path");
+    if (!json_is_string(path_v)) throw std::runtime_error("[JSE] $meta requires string 'path'");
+    return compile_field(json_path_expr(alias, "meta", json_string_value(path_v)), meta, ctx);
 }
 
 std::string key_id_subquery(Ctx& ctx, const std::string& key) {
@@ -301,7 +303,7 @@ std::string compile_khop(const json_t* hop, Ctx& ctx, const std::string& alias) 
 std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias) {
     if (!json_is_object(node)) throw std::runtime_error("[JSE] node must be an object");
 
-    static const char* op_keys[] = {"$and", "$or", "$not", "$meta", "$fti", "$search", "$triple", "$k-hop"};
+    static const char* op_keys[] = {"$and", "$or", "$not", "$meta", "$key", "$fti", "$search", "$triple", "$k-hop"};
     int present = 0;
     for (const char* k : op_keys) {
         if (json_object_get(node, k)) present++;
@@ -332,6 +334,10 @@ std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias)
     if (const json_t* v = json_object_get(node, "$meta")) {
         require_object(v, "$meta");
         return compile_meta(v, ctx, alias);
+    }
+    if (const json_t* v = json_object_get(node, "$key")) {
+        require_object(v, "$key");
+        return compile_field(alias + ".key", v, ctx);
     }
     if (const json_t* v = json_object_get(node, "$fti")) {
         if (!json_is_string(v)) throw std::runtime_error("[JSE] $fti requires a string");
@@ -389,6 +395,10 @@ std::string order_expr(Ctx& ctx, const std::string& alias, const std::string& ke
         if (ctx.fti_tsq.empty()) throw std::runtime_error("[JSE] $order $fti_rank requires an $fti node");
         return "ts_rank(" + alias + ".search_tsv, to_tsquery('simple', " + bind_param(ctx, ctx.fti_tsq) + ")) " + upper;
     }
+    if (key == "$in_degree")
+        return "(SELECT count(*) FROM statement st WHERE st.object_id = " + alias + ".id AND st.is_active) " + upper;
+    if (key == "$out_degree")
+        return "(SELECT count(*) FROM statement st WHERE st.subject_id = " + alias + ".id AND st.is_active) " + upper;
     if (key.rfind("meta.", 0) == 0) return json_path_expr(alias, "meta", key.substr(5)) + " " + upper;
     if (base_columns().count(key)) return alias + "." + key + " " + upper;
     throw std::runtime_error("[JSE_SECURITY] invalid order key: " + key);
@@ -419,6 +429,23 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
     }
 
     std::string where_sql = compile_node(where, ctx, alias);
+
+    json_int_t out_limit = 100;
+    if (json_is_integer(json_object_get(query, "$limit"))) {
+        out_limit = json_integer_value(json_object_get(query, "$limit"));
+        if (out_limit < 1) out_limit = 1;
+        if (out_limit > 1000) out_limit = 1000;
+    }
+
+    const json_t* group_v = json_object_get(query, "$group_by");
+    if (json_is_string(group_v)) {
+        std::string gexpr = project_expr(alias, json_string_value(group_v));
+        CompiledQuery out;
+        out.sql = cte + "SELECT " + gexpr + " AS \"group\", count(*) AS count FROM knowledge " + alias +
+                  " WHERE " + where_sql + " GROUP BY 1 ORDER BY count DESC LIMIT " + std::to_string(out_limit);
+        out.params = ctx.params;
+        return out;
+    }
 
     if (json_is_true(json_object_get(query, "$count"))) {
         CompiledQuery out;
