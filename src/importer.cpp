@@ -361,6 +361,9 @@ void import_analysis(Db& db, const ImportOptions& opt) {
                         std::string rel = relpath_of(cfile, opt.root);
                         std::string okey = make_key(opt.project, rel, callee);
                         note_endpoint(okey, callee, rel);
+                        // Ambiguous caller names (same name in many files) produce false
+                        // edges; skip them unless fan-out is explicitly requested.
+                        if (it->second.size() > 1 && !opt.fanout) continue;
                         for (const auto& skey : it->second) add_edge(skey, P_CALLS, okey);
                     }
                 }

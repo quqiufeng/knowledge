@@ -203,7 +203,7 @@ int usage() {
                  "  context  <key>   [--depth N] [--k N] [--predicate <key>]\n"
                  "                   [--no-content] [--max-code-bytes N] [--vector-cmd <cmd>]\n"
                  "  import   --analysis-dir <dir> --project <p> --root <r>\n"
-                 "           [--limit N] [--skip-callgraph] [--skip-dataflow]\n"
+                 "           [--limit N] [--skip-callgraph] [--skip-dataflow] [--fanout]\n"
                  "  import-books [--books-dir <dir>] [--book <name>] [--limit N]\n"
                  "  import-records <file> [--format jsonl|csv] [--key-field key] [--kind K]\n"
                  "                 [--text-field F] [--prefix /data/]\n"
@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
             if (a.rfind("--", 0) == 0) {
                 std::string name = a.substr(2);
                 if (name == "skip-callgraph" || name == "skip-dataflow" || name == "no-code" ||
-                    name == "no-content" || name == "ro" || name == "force") {
+                    name == "no-content" || name == "ro" || name == "force" || name == "fanout") {
                     opts[name] = "true";
                 } else if (i + 1 < argc) {
                     opts[name] = argv[++i];
@@ -324,6 +324,7 @@ int main(int argc, char** argv) {
             io.limit = opts.count("limit") ? std::atol(opts["limit"].c_str()) : 0;
             io.skip_callgraph = opts.count("skip-callgraph") > 0;
             io.skip_dataflow = opts.count("skip-dataflow") > 0;
+            io.fanout = opts.count("fanout") > 0;
             Db db(default_conninfo());
             import_analysis(db, io);
             return 0;
