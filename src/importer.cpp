@@ -6,6 +6,8 @@
 #include <jansson.h>
 
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -28,6 +30,30 @@ const char* P_USES = "/pred/uses";
 
 std::string make_key(const std::string& project, const std::string& rel, const std::string& name) {
     return "/code/local/" + project + "/" + rel + "/" + name;
+}
+
+inline uint64_t fnv1a(const char* p, size_t n, uint64_t h = 1469598103934665603ULL) {
+    for (size_t i = 0; i < n; ++i) {
+        h ^= static_cast<unsigned char>(p[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+inline uint64_t hash64(const std::string& s) { return fnv1a(s.data(), s.size()); }
+
+inline uint64_t edge_hash(const std::string& s, const std::string& p, const std::string& o) {
+    uint64_t h = fnv1a(s.data(), s.size());
+    h = fnv1a(&"\x1f"[0], 1, h);
+    h = fnv1a(p.data(), p.size(), h);
+    h = fnv1a(&"\x1f"[0], 1, h);
+    return fnv1a(o.data(), o.size(), h);
+}
+
+constexpr size_t TOKENIZE_MAX = 8192;
+
+double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 std::string jstr(const json_t* o, const char* k) {
@@ -225,9 +251,22 @@ void import_analysis(Db& db, const ImportOptions& opt) {
     }
 
     std::unordered_map<std::string, std::vector<std::string>> name2keys;
-    std::unordered_set<std::string> known_keys;
+    std::unordered_set<uint64_t> known_keys;
     std::unordered_map<std::string, std::pair<std::string, std::string>> stub_funcs;  // key -> (name, rel)
     std::unordered_map<std::string, std::string> stub_vars;                           // key -> var name
+
+    double t0 = now_s();
+
+    // Pass A: collect caller names so name2keys only stores names the call graph needs.
+    std::unordered_set<std::string> caller_names;
+    if (!opt.skip_callgraph) {
+        JsonObjectStream cs(opt.analysis_dir + "/call_graph.json");
+        if (cs.ok()) {
+            std::string ck, cv;
+            while (cs.next(ck, cv)) caller_names.insert(ck);
+        }
+        std::cerr << "[IMPORT] caller names: " << caller_names.size() << " (" << (now_s() - t0) << "s)\n";
+    }
 
     db.exec("BEGIN");
     db.exec("CREATE TEMP TABLE stg_knowledge(key text, meta text, content text, terms text) ON COMMIT DROP");
@@ -269,22 +308,22 @@ void import_analysis(Db& db, const ImportOptions& opt) {
             std::string meta = build_meta(jstr(d, "kind"), jstr(d, "language"), rel, jint(d, "line_start"),
                                           name, jstr(d, "signature"));
             std::string content = build_content(jstr(d, "content"), jstr(d, "docstring"));
-            std::string terms = to_tsvector_text(
-                tokenize_code(name + " " + jstr(d, "signature") + " " + jstr(d, "content")));
+            std::string terms = to_tsvector_text(tokenize_code(
+                name + " " + jstr(d, "signature") + " " + truncate_utf8(jstr(d, "content"), TOKENIZE_MAX)));
             json_decref(d);
 
-            if (known_keys.insert(key).second) {
+            if (known_keys.insert(hash64(key)).second) {
                 add_knowledge(key, meta, content, terms);
-                name2keys[name].push_back(key);
+                if (!opt.skip_callgraph && caller_names.count(name)) name2keys[name].push_back(key);
                 chunk_count++;
             }
         }
-        std::cerr << "[IMPORT] chunks: " << chunk_count << " entries\n";
+        std::cerr << "[IMPORT] chunks: " << chunk_count << " entries (" << (now_s() - t0) << "s)\n";
     }
 
     long edges = 0;
     std::string ebuffer;
-    std::unordered_set<std::string> seen_edges;
+    std::unordered_set<uint64_t> seen_edges;
     auto flush_e = [&]() {
         if (ebuffer.empty()) return;
         db.copy_in("COPY stg_statement (subject, predicate, object) FROM STDIN", ebuffer);
@@ -292,13 +331,13 @@ void import_analysis(Db& db, const ImportOptions& opt) {
     };
     auto add_edge = [&](const std::string& s, const std::string& p, const std::string& o) {
         if (s.empty() || o.empty()) return;
-        if (!seen_edges.insert(s + "\x1f" + p + "\x1f" + o).second) return;
+        if (!seen_edges.insert(edge_hash(s, p, o)).second) return;
         ebuffer += escape_copy(s) + "\t" + escape_copy(p) + "\t" + escape_copy(o) + "\n";
         edges++;
         if (ebuffer.size() >= FLUSH_BYTES) flush_e();
     };
     auto note_endpoint = [&](const std::string& key, const std::string& name, const std::string& rel) {
-        if (!known_keys.count(key)) stub_funcs.emplace(key, std::make_pair(name, rel));
+        if (!known_keys.count(hash64(key))) stub_funcs.emplace(key, std::make_pair(name, rel));
     };
 
     if (!opt.skip_callgraph) {
@@ -375,13 +414,47 @@ void import_analysis(Db& db, const ImportOptions& opt) {
     flush_e();
 
     std::cerr << "[IMPORT] stub funcs: " << stub_funcs.size() << ", vars: " << stub_vars.size()
-              << ", edges: " << edges << "\n";
+              << ", edges: " << edges << " (" << (now_s() - t0) << "s)\n";
 
+    double t_load = now_s();
+    db.exec("SET LOCAL synchronous_commit = off");
+    db.exec("SET LOCAL work_mem = '256MB'");
+    db.exec("SET LOCAL maintenance_work_mem = '512MB'");
+
+    // Drop secondary indexes / FKs only for large loads; for small projects the fixed
+    // rebuild cost (~tens of seconds) outweighs per-row maintenance.
+    const bool bulk = (chunk_count + edges) > 200000;
+
+    // Referential integrity is guaranteed by the importer (stub endpoints exist for
+    // every referenced key), so drop FKs during bulk load and rebuild them afterwards.
+    if (bulk) {
+        db.exec("ALTER TABLE statement DROP CONSTRAINT IF EXISTS statement_subject_id_fkey");
+        db.exec("ALTER TABLE statement DROP CONSTRAINT IF EXISTS statement_predicate_id_fkey");
+        db.exec("ALTER TABLE statement DROP CONSTRAINT IF EXISTS statement_object_id_fkey");
+    }
+
+    const char* drop_indexes[] = {
+        "DROP INDEX IF EXISTS idx_knowledge_kind", "DROP INDEX IF EXISTS idx_knowledge_lang",
+        "DROP INDEX IF EXISTS idx_knowledge_symbol", "DROP INDEX IF EXISTS idx_knowledge_file",
+        "DROP INDEX IF EXISTS idx_knowledge_fti", "DROP INDEX IF EXISTS idx_knowledge_meta",
+        "DROP INDEX IF EXISTS idx_stmt_fwd", "DROP INDEX IF EXISTS idx_stmt_rev",
+        "DROP INDEX IF EXISTS idx_stmt_pred",
+    };
+    if (bulk) {
+        for (const char* s : drop_indexes) db.exec(s);
+    }
+
+    double t_k = now_s();
     db.exec(
         "INSERT INTO knowledge (key, meta, content, search_tsv) "
-        "SELECT key, meta::jsonb, content::jsonb, to_tsvector('simple', terms) FROM stg_knowledge "
+        "SELECT key, meta::jsonb, content::jsonb, "
+        "COALESCE(array_to_tsvector(string_to_array(NULLIF(terms, ''), ' ')), ''::tsvector) "
+        "FROM stg_knowledge "
         "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
         "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()");
+    std::cerr << "[IMPORT] knowledge insert: " << (now_s() - t_k) << "s\n";
+
+    double t_s = now_s();
     db.exec(
         "INSERT INTO statement (subject_id, predicate_id, object_id) "
         "SELECT s.id, p.id, o.id FROM stg_statement t "
@@ -389,8 +462,40 @@ void import_analysis(Db& db, const ImportOptions& opt) {
         "JOIN knowledge p ON p.key = t.predicate "
         "JOIN knowledge o ON o.key = t.object "
         "ON CONFLICT DO NOTHING");
+    std::cerr << "[IMPORT] statement insert: " << (now_s() - t_s) << "s\n";
+
+    if (bulk) {
+        db.exec(
+            "ALTER TABLE statement ADD CONSTRAINT statement_subject_id_fkey "
+            "FOREIGN KEY (subject_id) REFERENCES knowledge(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED");
+        db.exec(
+            "ALTER TABLE statement ADD CONSTRAINT statement_predicate_id_fkey "
+            "FOREIGN KEY (predicate_id) REFERENCES knowledge(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED");
+        db.exec(
+            "ALTER TABLE statement ADD CONSTRAINT statement_object_id_fkey "
+            "FOREIGN KEY (object_id) REFERENCES knowledge(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED");
+    }
+
+    if (bulk) {
+        double t_i = now_s();
+        const char* create_indexes[] = {
+            "CREATE INDEX idx_knowledge_kind ON knowledge ((meta->>'kind')) WHERE is_active",
+            "CREATE INDEX idx_knowledge_lang ON knowledge ((meta->>'lang')) WHERE is_active",
+            "CREATE INDEX idx_knowledge_symbol ON knowledge ((meta->>'symbol')) WHERE is_active",
+            "CREATE INDEX idx_knowledge_file ON knowledge ((meta->>'file')) WHERE is_active",
+            "CREATE INDEX idx_knowledge_fti ON knowledge USING GIN (search_tsv) WHERE is_active",
+            "CREATE INDEX idx_knowledge_meta ON knowledge USING GIN (meta jsonb_path_ops) WHERE is_active",
+            "CREATE INDEX idx_stmt_fwd ON statement (subject_id, predicate_id, object_id) WHERE is_active",
+            "CREATE INDEX idx_stmt_rev ON statement (object_id, predicate_id, subject_id) WHERE is_active",
+            "CREATE INDEX idx_stmt_pred ON statement (predicate_id) WHERE is_active",
+        };
+        for (const char* s : create_indexes) db.exec(s);
+        std::cerr << "[IMPORT] index rebuild: " << (now_s() - t_i) << "s\n";
+    }
+
     db.exec("DROP TABLE stg_knowledge");
     db.exec("DROP TABLE stg_statement");
     db.exec("COMMIT");
+    std::cerr << "[IMPORT] db load: " << (now_s() - t_load) << "s, total: " << (now_s() - t0) << "s\n";
     std::cerr << "[IMPORT] done\n";
 }

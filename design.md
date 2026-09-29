@@ -323,6 +323,11 @@ design.md             # 本文档
 - [x] **`$k-hop` 结果上限**：递归子查询尾部 `LIMIT 20000`，防扇出爆炸
 - [x] **混合检索（RRF）**：`search` = 向量候选 + 全文候选（`$fti` + `$fti_rank`），RRF 融合后过标量过滤；结果带 `rrf/vector_rank/lexical_rank/vector_score`
 - [x] **导入流式化**：`JsonObjectStream` 逐条解析顶层对象，`call_graph.json`/`dataflow.json` 不再整文件载入内存；python 全量（11M call_graph / 18M dataflow）→ 55402 条目 / 132441 边 / 12.9s，结果与旧实现一致
+- [x] **导入性能优化**（Linux 7.1.2：1,315,417 条目 / 1,569,588 边）
+      - 内存：`name2keys` 只存调用图用到的名字、`known_keys`/`seen_edges` 改用 64 位哈希 → 峰值 RSS 271MB
+      - DB 载入：`array_to_tsvector`（免二次解析）替代 `to_tsvector`
+      - 大项目（>20 万行）自动「丢索引/FK → 批量重建」，小项目保持增量（避免固定重建开销）
+      - 结果：290s → 200s（chunks 67s / knowledge insert 67s / statement 15s / 索引重建 39s）
 
 ### 进行中 🚧
 
