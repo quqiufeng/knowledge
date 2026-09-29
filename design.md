@@ -1,0 +1,347 @@
+# Knowledge — 技术设计文档（design.md）
+
+> 数据库版**知识检索**系统：把代码仓库索引语料与电子书文本归一为「条目 + 三元组」，用受控的 JSE 查询语言供 AI Agent 安全访问。
+> 本文记录技术架构、关键决策与任务进度。更新于 2026-09-29。
+
+---
+
+## 1. 项目定位
+
+现有 `my_db`（/opt/my_db）是一套 C 引擎 + mmap KV + 外挂 HNSW 的本地语义搜索系统，提供两套产物：
+
+- **代码**：`chunks_meta.jsonl`、`call_graph.json`、`dataflow.json`、`*.jina.bin`
+- **电子书**：`/opt/books/{book}/chapters/**/page_*.md`、`books_{name}.jina.bin`
+
+本项目将其**知识层**迁移并升级为数据库化的 Ontology 系统：
+
+- **归一存储**：任意业务对象 → 条目（动态 JSON）；任意关系 → 三元组。仅两张表。
+- **受控查询**：AI 不写 SQL，只产出 JSE（JSON S-Expression），由编译器翻译为参数化 SQL 并注入口径/权限。
+- **可演化本体**：规范、谓词定义、Action schema 本身就存为条目（schema-as-data）。
+- **持久与可审计**：历史（归档 + snapshot 三元组）是一等数据。
+
+对照对象：Palantir Ontology（schema-first）。本项目取 data-first 路线——数据先行，本体作为数据的一部分生长。
+
+---
+
+## 2. 总体架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 消费面                                                       │
+│   AI Agent 插件（宿主中立）  · Web / CLI                     │
+└───────────────┬─────────────────────────────────────────────┘
+                │ JSE 表达式（JSON AST）
+┌───────────────▼─────────────────────────────────────────────┐
+│ 查询层（C++）                                                 │
+│   JSE 校验 → AST → 编译器 → 参数化 SQL                        │
+│   路径白名单 · 值参数绑定 · 口径注入（AND is_active）          │
+└───────┬───────────────────────────────────┬─────────────────┘
+        │                                   │
+┌───────▼───────────┐             ┌─────────▼─────────────────┐
+│ 外挂向量引擎       │             │ PostgreSQL 16             │
+│  .hnsw / USearch  │             │  knowledge（节点）         │
+│  $search 候选 key  │             │  statement（边）           │
+└───────────────────┘             │  search_tsv（应用层分词的   │
+                                  │   tsvector + GIN）          │
+                                  └─────────▲─────────────────┘
+                                            │ 受控写入管线
+┌───────────────────────────────────────────┴─────────────────┐
+│ 输入源（my_db 产物，零重算）                                  │
+│  代码：chunks_meta.jsonl · call_graph.json · dataflow.json    │
+│  电子书：/opt/books/**/page_*.md（book/chapter/page + contains）│
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 数据模型
+
+### 3.1 两张表
+
+| 表 | 角色 | 关键列 |
+|---|---|---|
+| `knowledge` | 节点 / 条目 | `id`、`key`（全表唯一）、`meta` JSONB、`content` JSONB、`search_tsv`、`version`、`start_time/end_time`、`is_archived`、`is_active` |
+| `statement` | 边 / 三元组 | `id`、`subject_id/predicate_id/object_id`（BIGINT 代理键）、`meta`、`start_time/end_time`、`is_archived`、`is_active` |
+
+### 3.2 代码域映射
+
+| my_db 数据 | Knowledge 形态 |
+|---|---|
+| chunk（函数/结构体/宏） | 条目 `key=/code/{proj}/chunks/{file}/{symbol}`，`meta={kind,lang,file,line,symbol}`，`content={code}` |
+| 符号索引 | 条目（由 chunk 条目承担） |
+| `call_graph.json` | 三元组 `A -calls→ B` |
+| `dataflow.json`（DEF/SET/USE/字段） | 三元组 `defines/assigns/uses/has_field` |
+| import/export 边 | 三元组 `imports/exports` |
+| 谓词定义 | 条目 `meta.category=predicate`，key 形如 `/pred/calls` |
+| 规范定义 | 条目 `meta.category=spec`（规划中） |
+
+### 3.3 电子书域映射
+
+`knowledge import-books` 读取 my_db 电子书系统产出的 Markdown（`/opt/books/{book}/chapters/**/page_*.md`）：
+
+| 电子书产物 | Knowledge 形态 |
+|---|---|
+| `_meta.json` | 条目 `/books/{book}`，`meta={kind:book, title, author}` |
+| 章节目录 | 条目 `/books/{book}/chapters/{chapter}`，`meta={kind:book_chapter, order}` |
+| `page_NNNN.md` | 条目 `/books/{book}/chapters/{chapter}/page_NNNN`，`meta={kind:book_page, book, chapter, page, file}`，`content={text}` |
+| 归属关系 | 三元组 `book -contains→ chapter -contains→ page`（谓词 `/pred/contains`） |
+
+**key 天然对齐**：my_db 的 `cache_query` 对书籍返回的 `results[].name` 正是上述 page key，
+因此 `tools/vector_provider_books.sh` 只需透传 `name`→`key`，无需路径映射。
+
+> 全文：书籍正文以中文为主，`search_tsv` 直接由原文经 `to_tsvector('simple', ...)` 生成（不经代码分词器）；
+> 中文检索主要依赖语义搜索 `$search`。
+
+### 3.4 状态单轨与有效期
+
+```sql
+is_active BOOLEAN NOT NULL
+  GENERATED ALWAYS AS (NOT is_archived AND end_time IS NULL) STORED
+```
+
+- 选择 `STORED` 生成列而非时间函数：`now()` 是 STABLE，**不能**用于生成列（PG 要求 IMMUTABLE），因此定义收窄为「未归档且未设终止时间」。
+- 若将来需要「预设未来失效」语义，改由受控写入管线维护普通列或触发器。
+- 编译器默认注入 `AND is_active`，与 partial index 谓词**逐字一致**，保证索引命中。
+
+### 3.5 索引
+
+```sql
+-- 图遍历
+CREATE INDEX idx_stmt_fwd ON statement (subject_id, predicate_id, object_id) WHERE is_active;
+CREATE INDEX idx_stmt_rev ON statement (object_id, predicate_id, subject_id) WHERE is_active;
+CREATE INDEX idx_stmt_pred ON statement (predicate_id) WHERE is_active;
+-- 条目热字段
+CREATE INDEX idx_knowledge_kind   ON knowledge ((meta->>'kind'))   WHERE is_active;
+CREATE INDEX idx_knowledge_lang   ON knowledge ((meta->>'lang'))   WHERE is_active;
+CREATE INDEX idx_knowledge_symbol ON knowledge ((meta->>'symbol')) WHERE is_active;
+CREATE INDEX idx_knowledge_file   ON knowledge ((meta->>'file'))   WHERE is_active;
+-- 全文 / JSONB
+CREATE INDEX idx_knowledge_fti  ON knowledge USING GIN (search_tsv) WHERE is_active;
+CREATE INDEX idx_knowledge_meta ON knowledge USING GIN (meta jsonb_path_ops) WHERE is_active;
+```
+
+---
+
+## 4. JSE 查询语言
+
+### 4.1 形态
+
+AI 只产出 JSON AST，编译器负责翻译与安全。示例：
+
+```json
+{
+  "$and": [
+    { "$meta": { "path": "lang", "$eq": "c" } },
+    { "$fti": "page_alloc" },
+    { "$k-hop": { "depth": 2, "predicates": ["/pred/calls"],
+                  "where": { "$meta": { "path": "kind", "$eq": "function" } } } }
+  ],
+  "$project": ["key", "meta.symbol", "meta.file"],
+  "$order": { "$search_score": "desc" },
+  "$limit": 20
+}
+```
+
+### 4.2 算子清单
+
+| 类别 | 算子 |
+|---|---|
+| 逻辑 | `$and` `$or` `$not` |
+| 属性 | `$meta`（`path` + `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists`） |
+| 全文 | `$fti`（应用层分词，OR 语义） |
+| 向量 | `$search`（外挂引擎候选 key，配合 `$search_score` 排序） |
+| 关系 | `$triple`（`subject`/`predicate`/`object`）、`$k-hop`（`from`/`predicates`/`depth`/`direction`/`where`） |
+| 修饰 | `$project` `$order` `$limit` `$offset` |
+
+### 4.3 路径约定
+
+- `$meta.path` 相对 `meta` 根（`lang` → `meta->>'lang'`）
+- `$project` / `$order` 从行根起算（`key`、`meta.symbol`、`content.code`）
+
+### 4.4 图遍历编译（核心）
+
+`$k-hop` 编译为递归 CTE，遵循「仅传整型 ID 拓扑 + path 防环 + 深度硬限 + Late Binding」：
+
+```sql
+knowledge.id IN (
+  WITH RECURSIVE chain AS (
+    SELECT k.id AS current_id, 0 AS depth, ARRAY[k.id] AS path
+    FROM knowledge k WHERE k.key = $1 AND k.is_active
+    UNION ALL
+    SELECT st.object_id, c.depth + 1, c.path || st.object_id
+    FROM statement st JOIN chain c ON st.subject_id = c.current_id
+    WHERE c.depth < $2
+      AND st.predicate_id IN (SELECT id FROM knowledge WHERE key = ANY($3::text[]))
+      AND st.is_active
+      AND NOT (st.object_id = ANY(c.path))
+  )
+  SELECT c.current_id FROM chain c JOIN knowledge k ON k.id = c.current_id
+  WHERE c.depth > 0 AND k.meta->>'kind' = $4
+)
+```
+
+- `depth` = 边数（anchor 从 0 计，结果排除起点）
+- `direction: out` 沿 subject→object（callees），`in` 反向（callers）
+- 环路检测用 `path` 数组，防函数互递归死循环
+
+---
+
+## 5. 检索层
+
+### 5.1 全文（应用层预分词）
+
+代码标识符（`__alloc_pages_slowpath`、`AllocPageSlow`）无法被默认分词器友好切分，故在**应用层**分词后写入 `search_tsv`：
+
+1. 按非字母数字切词，保留整个标识符
+2. 拆分 snake_case（`_`）与 camelCase
+3. 去停用词、小写、去重
+4. 写入 `to_tsvector('simple', tokens.join(' '))`
+
+查询侧对 `$fti` 文本做同样分词，构造 `token1 | token2 | ...` 的 OR 查询：
+`search_tsv @@ to_tsquery('simple', $n)`。
+
+效果：搜 `page_alloc` 可命中 `__alloc_pages_slowpath`（`page` / `alloc` 子词）。
+
+### 5.2 向量（外挂引擎）
+
+- 向量不入 PG，沿用 my_db 现有 `.jina.bin` + `.hnsw`（768 维）。
+- JSE `$search` 执行流程：应用层调用外挂引擎得到候选 `[{key, score}]` → 作为 `VALUES` CTE 传入编译器 → SQL 侧与标量过滤求交、按 `$search_score` 排序。
+- 优点：向量更新/重建语义沿用现有工具；PG 只存标量，规模可控。
+
+**Provider 契约**：外挂引擎以命令形式接入，接口固定为
+
+```
+<cmd> '<query>' <k>   ->   {"results":[{"key":"...","score":0.91}, ...]}
+```
+
+由 `--vector-cmd` / `KNOWLEDGE_VECTOR_CMD` 指定。真实适配器 `tools/vector_provider.sh` 包装 my_db 的 `cache_query --analysis-dir`，并做 key 归一：
+
+```
+key = /code/local/{project}/{file-relative-to-root}/{symbol}
+```
+
+C++ 侧 `src/vector.cpp` 用 `popen` 调用并解析，结果喂给 `compile_query` 的 `vectors`。
+
+### 5.3 上下文供给（对外契约）
+
+`knowledge context <key> --depth N` 一次返回符号的完整上下文包，供外部语料/微调系统消费：
+
+| 字段 | 内容 | 来源 |
+|---|---|---|
+| `definition` | 完整源码 + meta + version | `knowledge` 表 |
+| `callers` / `callees` | 直接调用关系 | `statement` 表 |
+| `paths` | 调用路径节点序列（起点→终点，带 depth） | 递归 CTE（text[] 累积 key） |
+| `related` | 语义近邻 + score | 外挂向量引擎 + PG 回填 |
+
+`knowledge search <query>` 则是语义搜索 + 标量过滤的融合出口。二者构成"本项目只供上下文、不产语料"的边界。
+
+---
+
+## 6. 安全模型
+
+| 风险 | 对策 |
+|---|---|
+| SQL 注入（值） | 所有值走 `$n` 参数绑定 |
+| SQL 注入（JSONB 路径不可参数化） | 正则白名单 `^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$` + 逐段校验，非法即拒绝 |
+| 任意 SQL | AI 只能产出受限 AST；编译器只生成参数化 SELECT |
+| 口径绕过 | `is_active` 在编译期注入，partial index 与之一致 |
+| 谓词硬编码 | 谓词以 key 表示，编译期经 `knowledge` 表解析为 `predicate_id` |
+
+---
+
+## 7. 目录结构
+
+```
+Makefile              # 编译出单一二进制 knowledge
+schema.sql            # DDL（PG16）
+src/
+  tokenize.hpp/.cpp   # 代码标识符分词器
+  compile.hpp/.cpp    # JSE 校验 + 编译器（jansson + 参数化 SQL）
+  vector.hpp/.cpp     # 外挂向量引擎 provider 调用
+  importer.hpp/.cpp   # 代码知识导入器（chunks/call_graph/dataflow）
+  books.hpp/.cpp      # 电子书导入器（/opt/books 的 Markdown）
+  db.hpp/.cpp         # libpq 连接与查询
+  main.cpp            # CLI（tokenize / compile / query / search / context / import / import-books / seed）
+tools/                # ingest.sh（一键分析+入库）、vector_provider.sh、vector_provider_books.sh、vector_provider_stub.sh
+prompts/              # 向 Google AI 提问的三弹材料 + 统一 brief
+README.md             # 快速上手
+design.md             # 本文档
+```
+
+技术栈：**C++17 + libpq + jansson**，`make` 产出单文件二进制 `knowledge`（~150KB，动态链接系统库）。
+
+---
+
+## 8. 任务进度（Todolist）
+
+### 已完成 ✅
+
+- [x] **架构决策**：代理键、is_active 单轨、外挂向量、应用层分词、C++ 编译器
+- [x] **环境**：安装 PostgreSQL 16，建 `knowledge` 库
+- [x] **DDL**：`schema.sql`（双表 + 生成列 + 全部索引）并在 PG 落地
+- [x] **JSE 校验 + 编译器**：`compile.cpp`，全部算子（`$and/$or/$not/$meta/$fti/$search/$triple/$k-hop` + 修饰符），路径白名单 + 全参数化绑定
+- [x] **分词器**：`tokenize.cpp`（snake_case/camelCase 拆分）
+- [x] **写入 helper**：`main.cpp` 内 `upsert_entry` / `link_triple`（upsert 条目 / link 三元组）
+- [x] **C++ 实现**：`src/*.cpp` + `Makefile`，产出单文件二进制 `knowledge`（~150KB）
+  - [x] 分词器 / JSE 编译器 / libpq 访问全部移植
+  - [x] CLI：`tokenize` / `compile` / `query` / `search` / `context` / `seed`
+  - [x] 4 类查询（全文 / k-hop / triple / 向量）在真实 PG 命中
+  - [x] 安全：注入路径被拒、非法算子报错
+  - [x] 安装 libpq-dev，依赖 jansson（与 my_db 一致）
+
+- [x] **向量引擎接入**：`src/vector.cpp` provider 契约 + `tools/vector_provider.sh`（包装 `cache_query --analysis-dir`），`$search` / `search` / `context.related` 全部接通
+- [x] **上下文供给**：`knowledge context` 返回 定义 + callers/callees + 调用路径（节点序列）+ 语义近邻
+- [x] **`knowledge search`**：语义搜索 + PG 标量过滤融合出口
+
+- [x] **真实导入器**：`src/importer.cpp`，`knowledge import --analysis-dir --project --root`
+      - chunks_meta.jsonl → 条目；call_graph.json → `calls` 三元组；dataflow.json → `defines/assigns/uses` 三元组
+      - 缺失端点自动补 stub 条目（func / variable），保证边不被 JOIN 丢弃
+      - COPY staging + 单事务 + `ON CONFLICT` 落盘；redis 全量 8434 条目 + 3.6 万三元组，2.3s
+      - key 归一 `/code/local/{project}/{relpath}/{symbol}`，与 provider 完全对齐（已端到端验证）
+
+- [x] **一键流水线**：`tools/ingest.sh <repo>` = 分析（index/vector/hnsw）+ 入库；`--skip-analyze` 仅导入
+- [x] **token 友好输出**：`meta`/`content` 返回嵌套对象（不再双重转义）；`search` 默认回 `key/symbol/file/line/signature/score`；`context` 支持 `--no-content` / `--max-code-bytes`
+- [x] **电子书输入源**：`knowledge import-books`，`/opt/books/{book}/chapters/**/page_*.md` → book/chapter/page 条目 + `contains` 关系；`tools/vector_provider_books.sh` 接入 book 向量（key 与 `cache_query` 的 `name` 天然对齐）
+
+### 进行中 🚧
+
+- [ ] **多项目批量导入**：16 个仓库（约 250 万 chunk），分项目串行导入 + 校验
+- [ ] **大规模导入内存**：call_graph.json / dataflow.json 目前整体 `json_loads`，超大项目（Linux）需改流式解析
+
+### 待办 ⏳
+
+- [ ] **smoke test**：固化 4 类查询 + context 的回归测试
+- [ ] **迁移对账（第三弹 E14）**：mmap 旧系统 vs PG 新系统的双跑 diff 与灰度切流
+- [ ] **规范条目（第三弹 F17/F18）**：`meta.category=spec` 定义字段约束，写入校验与编译器共享路径白名单
+- [ ] **LLM 报错闭环（第三弹 H24）**：语法/安全/规范三层结构化 Error Payload + System Prompt
+- [ ] **Action 层（写侧）**：声明式动作 + 前置校验 + 归档/snapshot + 乐观锁（`version`）
+- [ ] **Agent 插件**：宿主中立的 JSE 工具封装（DSH / Claude Code / opencode）
+- [ ] **触发第三弹提问**：迁移对账、规范校验、LLM 报错
+
+### 阻塞 / 依赖
+
+- **真实导入器**是当前唯一关键路径：需把 `my_db` 产出（`chunks_meta.jsonl` / `call_graph.json` / `dataflow.json`）归一入库，并让 key 与向量 provider 的 `/code/local/{project}/{relpath}/{symbol}` 对齐。
+- 导入完成前，`search` / `context.related` 只能命中 `seed` 的演示数据。
+- 向量引擎已跑通（`cache_query --analysis-dir`），无阻塞。
+
+---
+
+## 9. 关键决策记录（ADR 摘要）
+
+| # | 决策 | 理由 | 否决项 |
+|---|---|---|---|
+| 1 | 三元组端点用 BIGINT 代理键 | 千万级下索引缩小 60-70%、整数比较快 2-5x | TEXT key 易超长、索引膨胀、重构需级联 |
+| 2 | `is_active` 生成列（不含时间函数） | IMMUTABLE 才能做生成列；谓词与索引一致 | 含 `now()` 的生成列在 PG 非法 |
+| 3 | `key` 全表唯一（非 partial） | FK 引用目标 + 逻辑身份 | partial unique 不能作 FK 目标 |
+| 4 | 向量外挂、不入 PG | 沿用现有 HNSW、PG 只存标量 | pgvector 更新/删除语义与迁移成本 |
+| 5 | 全文应用层预分词 + `search_tsv` | 代码标识符默认分词器命中差；通用可移植 | pg_search/BM25 引入第三方扩展 |
+| 6 | 编译器用 C++17 + libpq + jansson | 可编译为单文件二进制、与 my_db 工具链一致、无运行时依赖 | TypeScript（需 Node/Bun 运行时）、Go |
+| 7 | `$k-hop` 用递归 CTE（ID 拓扑） | 免引入图数据库；写侧实时更新友好 | ltree（树限制，无法表达 DAG/环）、物化闭包表（维护成本高） |
+
+---
+
+## 10. 参考
+
+- 原始路线分析：`prompts/context-brief.md`
+- 提问材料：`prompts/strike-1.md`、`strike-2.md`、`strike-3.md`
+- 快速上手：`README.md`
