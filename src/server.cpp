@@ -28,12 +28,8 @@ std::string dump(const json_t* v, size_t flags = JSON_COMPACT) {
 
 class Pool {
   public:
-    Pool(const std::string& conninfo, int n) {
-        for (int i = 0; i < n; ++i) {
-            auto db = std::make_unique<Db>(conninfo);
-            db->exec("SET statement_timeout = '30s'");
-            conns_.push_back(std::move(db));
-        }
+    Pool(const std::string& conninfo, int n) : conninfo_(conninfo) {
+        for (int i = 0; i < n; ++i) conns_.push_back(std::make_unique<Db>(conninfo, 30000));
     }
 
     class Lease {
@@ -53,9 +49,17 @@ class Pool {
     Db* acquire() {
         std::unique_lock<std::mutex> lk(m_);
         cv_.wait(lk, [&] { return !conns_.empty(); });
-        Db* db = conns_.back().release();
+        std::unique_ptr<Db> db(conns_.back().release());
         conns_.pop_back();
-        return db;
+        if (db->healthy()) return db.release();
+        // Server restarted / idle timeout: swap in a fresh connection. If the
+        // DB is unreachable, hand back the dead one so the request fails with a
+        // clear error instead of hanging (and the pool never shrinks).
+        try {
+            return std::make_unique<Db>(conninfo_, 30000).release();
+        } catch (...) {
+            return db.release();
+        }
     }
     void release(Db* db) {
         {
@@ -65,6 +69,7 @@ class Pool {
         cv_.notify_one();
     }
 
+    std::string conninfo_;
     std::vector<std::unique_ptr<Db>> conns_;
     std::mutex m_;
     std::condition_variable cv_;
@@ -107,6 +112,8 @@ int run_server(const ServerOptions& opt) {
 
     httplib::Server svr;
     svr.set_payload_max_length(1 << 20);
+    svr.set_read_timeout(60);   // search may embed the query (GPU)
+    svr.set_write_timeout(60);
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         set_json(res, 200, R"({"status":"ok"})");
@@ -165,12 +172,14 @@ int run_server(const ServerOptions& opt) {
         int k = req.has_param("k") ? std::atoi(req.get_param_value("k").c_str()) : 10;
         std::string pred = req.has_param("predicate") ? req.get_param_value("predicate") : "/pred/calls";
         bool no_content = req.has_param("no_content");
+        bool exclude_headers = req.has_param("exclude_headers");
         long max_bytes = req.has_param("max_code_bytes")
                              ? std::atol(req.get_param_value("max_code_bytes").c_str())
                              : 0;
         try {
             Pool::Lease lease(pool);
-            json_t* r = api_context(lease.db(), key, depth, k, pred, opt.vector_cmd, no_content, max_bytes);
+            json_t* r = api_context(lease.db(), key, depth, k, pred, opt.vector_cmd, no_content,
+                                    max_bytes, exclude_headers);
             set_json(res, 200, dump(r, JSON_INDENT(2)));
             json_decref(r);
         } catch (const std::exception& e) {

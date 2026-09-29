@@ -10,6 +10,9 @@
 #include "records.hpp"
 #include "server.hpp"
 #include "spec.hpp"
+#include "util.hpp"
+#include "vector.hpp"
+#include "write.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -20,6 +23,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -75,38 +79,24 @@ json_t* load_query(const std::string& text) {
     return q;
 }
 
-void upsert_entry(Db& db, const std::string& key, const std::string& meta_json,
-                  const std::string& content_json, const std::string& search_text) {
-    std::vector<std::string> tokens = tokenize_code(search_text + " " + meta_json);
-    std::string tsv = to_tsvector_text(tokens);
-    db.exec(
-        "INSERT INTO knowledge (key, meta, content, search_tsv) "
-        "VALUES ($1, $2::jsonb, $3::jsonb, to_tsvector('simple', $4)) "
-        "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
-        "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()",
-        {key, meta_json, content_json, tsv});
-}
-
-void link_triple(Db& db, const std::string& s, const std::string& p, const std::string& o) {
-    db.exec(
-        "INSERT INTO statement (subject_id, predicate_id, object_id) "
-        "SELECT s.id, p.id, o.id FROM knowledge s, knowledge p, knowledge o "
-        "WHERE s.key = $1 AND p.key = $2 AND o.key = $3 ON CONFLICT DO NOTHING",
-        {s, p, o});
-}
-
 void seed(Db& db) {
+    Db::Tx tx(db);
     const std::string p_calls = "/pred/calls";
     const std::string p_impl = "/pred/implements";
-    upsert_entry(db, p_calls, R"({"category":"predicate","name":"calls"})", "{}", "calls");
-    upsert_entry(db, p_impl, R"({"category":"predicate","name":"implements"})", "{}", "implements");
+    auto pred = [&](const std::string& key, const std::string& name) {
+        kwrite::upsert_entry(db, key, std::string(R"({"category":"predicate","name":")") + name + R"("})",
+                             "{}", name);
+    };
+    pred(p_calls, "calls");
+    pred(p_impl, "implements");
 
     auto func = [&](const std::string& sym, const std::string& file, int line, const std::string& code) {
         std::string key = "/code/local/linux/mm/" + file + "/" + sym;
         std::string meta = std::string(R"({"kind":"function","lang":"c","file":")") + file +
                            R"(","line":)" + std::to_string(line) + R"(,"symbol":")" + sym + R"("})";
         std::string content = std::string(R"({"code":")") + code + R"("})";
-        upsert_entry(db, key, meta, content, code + " " + sym);
+        std::vector<std::string> tokens = tokenize_code(code + " " + sym + " " + meta);
+        kwrite::upsert_entry(db, key, meta, content, to_tsvector_text(tokens));
         return key;
     };
 
@@ -120,22 +110,27 @@ void seed(Db& db) {
                              "struct page *alloc_pages(gfp_t gfp, unsigned int order) { return __alloc_pages_slowpath(); }");
     func("zmalloc", "zmalloc.c", 100, "void *zmalloc(size_t size) { void *ptr = malloc(size + PREFIX_SIZE); }");
 
-    link_triple(db, slowpath, p_calls, prepare);
-    link_triple(db, slowpath, p_calls, may_oom);
-    link_triple(db, alloc, p_calls, slowpath);
+    kwrite::link_edge(db, slowpath, p_calls, prepare, true);
+    kwrite::link_edge(db, slowpath, p_calls, may_oom, true);
+    kwrite::link_edge(db, alloc, p_calls, slowpath, true);
+    tx.commit();
+}
+
+void print_compiled(const CompiledQuery& cq) {
+    json_t* out = json_object();
+    json_object_set_new(out, "sql", json_string(cq.sql.c_str()));
+    json_t* params = json_array();
+    for (const auto& p : cq.params) json_array_append_new(params, json_string(p.c_str()));
+    json_object_set_new(out, "params", params);
+    std::cout << json_dump(out, JSON_INDENT(2)) << std::endl;
+    json_decref(out);
 }
 
 void run_query(Db& db, const json_t* query, const std::vector<VectorHit>& vectors, bool execute) {
     std::unordered_map<std::string, long long> cache;
     CompiledQuery cq = compile_query(query, make_options(db, vectors, cache));
     if (!execute) {
-        json_t* out = json_object();
-        json_object_set_new(out, "sql", json_string(cq.sql.c_str()));
-        json_t* params = json_array();
-        for (const auto& p : cq.params) json_array_append_new(params, json_string(p.c_str()));
-        json_object_set_new(out, "params", params);
-        std::cout << json_dump(out, JSON_INDENT(2)) << std::endl;
-        json_decref(out);
+        print_compiled(cq);
         return;
     }
     json_t* rows = db.query_json(cq.sql, cq.params);
@@ -143,44 +138,17 @@ void run_query(Db& db, const json_t* query, const std::vector<VectorHit>& vector
     json_decref(rows);
 }
 
+// Emit {"<field>":"<value>"} safely (keys/values may contain quotes).
+void print_kv(const char* field, const std::string& value) {
+    json_t* o = json_object();
+    json_object_set_new(o, field, json_string(value.c_str()));
+    std::cout << json_dump(o) << std::endl;
+    json_decref(o);
+}
+
 std::string env_or(const char* name, const std::string& fallback) {
     const char* v = std::getenv(name);
     return (v && *v) ? std::string(v) : fallback;
-}
-
-std::string sh_quote(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
-
-std::string run_cmd(const std::string& cmd) {
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) throw std::runtime_error("[CMD] popen failed");
-    std::string out;
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
-    int rc = pclose(p);
-    if (rc != 0 && out.empty()) throw std::runtime_error("[CMD] command failed: " + cmd);
-    return out;
-}
-
-std::vector<float> parse_float_vector(const std::string& text) {
-    std::vector<float> out;
-    json_t* arr = json_loads(text.c_str(), 0, nullptr);
-    if (json_is_array(arr)) {
-        for (size_t i = 0; i < json_array_size(arr); ++i) {
-            const json_t* e = json_array_get(arr, i);
-            if (json_is_number(e)) out.push_back(static_cast<float>(json_number_value(e)));
-        }
-    }
-    if (arr) json_decref(arr);
-    return out;
 }
 
 void split_csv(const std::string& s, std::vector<std::string>& out) {
@@ -279,31 +247,36 @@ int main(int argc, char** argv) {
 
         if (cmd == "compile" || cmd == "query") {
             std::string vectors_json = opts.count("vectors") ? opts["vectors"] : "";
-            json_t* query = load_query(read_stdin());
+            kutil::json_ptr query(load_query(read_stdin()));
             std::vector<VectorHit> vectors = parse_vectors(vectors_json);
-            Db db(default_conninfo());
-            run_query(db, query, vectors, cmd == "query");
-            json_decref(query);
+            if (cmd == "query") {
+                Db db(default_conninfo());
+                run_query(db, query.get(), vectors, true);
+                return 0;
+            }
+            // compile: the database is optional (it only powers key->id resolution).
+            std::unique_ptr<Db> db;
+            try {
+                db = std::make_unique<Db>(default_conninfo());
+            } catch (const std::exception& e) {
+                std::cerr << "[COMPILE] " << e.what() << "; key->id resolution disabled\n";
+            }
+            std::unordered_map<std::string, long long> cache;
+            CompileOptions copts;
+            copts.vectors = vectors;
+            if (db) copts.resolve_key = make_resolver(*db, cache);
+            print_compiled(compile_query(query.get(), copts));
             return 0;
         }
         if (cmd == "search") {
             if (pos.empty()) return usage();
             int k = opt_int("k", 20);
             std::string scalar = opts.count("where") ? opts["where"] : "";
-            std::vector<float> qvec;
-            if (!opts.count("vector-cmd")) {
-                // Default: embed the query and use pgvector for vector candidates.
-                std::string embed_cmd = opts.count("embed-cmd")
-                                            ? opts["embed-cmd"]
-                                            : env_or("KNOWLEDGE_EMBED_CMD", "./tools/embed_query.sh");
-                try {
-                    qvec = parse_float_vector(run_cmd(embed_cmd + " " + sh_quote(pos[0])));
-                } catch (const std::exception&) {
-                    qvec.clear();
-                }
-            }
+            std::string embed_cmd = opts.count("embed-cmd") ? opts["embed-cmd"] : "";
+            // Vector source is chosen inside api_search: --vector-cmd provider,
+            // otherwise embed (KNOWLEDGE_EMBED_CMD) + pgvector, else lexical only.
             Db db(default_conninfo());
-            json_t* r = api_search(db, pos[0], k, vector_cmd, scalar, qvec);
+            json_t* r = api_search(db, pos[0], k, vector_cmd, scalar, {}, embed_cmd);
             std::cout << json_dump(r, JSON_INDENT(2)) << std::endl;
             json_decref(r);
             return 0;
@@ -375,24 +348,24 @@ int main(int argc, char** argv) {
             if (opts.count("bin")) eo.bin_file = opts["bin"];
             if (opts.count("meta")) eo.meta_file = opts["meta"];
             Db db(default_conninfo());
-            long n = import_vectors(db, eo);
-            std::cout << "{\"vectors\":" << n << "}\n";
+            EmbedResult ev = import_vectors(db, eo);
+            json_t* o = json_object();
+            json_object_set_new(o, "vectors", json_integer(ev.matched));
+            json_object_set_new(o, "staged", json_integer(ev.staged));
+            std::cout << json_dump(o) << std::endl;
+            json_decref(o);
             return 0;
         }
         if (cmd == "qsearch") {
             if (pos.empty()) return usage();
             int k = opt_int("k", 10);
             std::string where = opts.count("where") ? opts["where"] : "";
-            std::string embed_cmd =
-                opts.count("embed-cmd") ? opts["embed-cmd"] : env_or("KNOWLEDGE_EMBED_CMD", "./tools/embed_query.sh");
-            std::string vec = run_cmd(embed_cmd + " " + sh_quote(pos[0]));
-            json_t* vecarr = json_loads(vec.c_str(), 0, nullptr);
-            if (!json_is_array(vecarr)) {
-                if (vecarr) json_decref(vecarr);
-                throw std::runtime_error("[QSEARCH] embedding failed (no vector)");
-            }
+            std::string embed_cmd = opts.count("embed-cmd") ? opts["embed-cmd"] : "";
+            std::vector<float> qvec = embed_text(pos[0], embed_cmd);
+            json_t* varr = json_array();
+            for (float f : qvec) json_array_append_new(varr, json_real(f));
             json_t* knn = json_object();
-            json_object_set_new(knn, "vector", json_incref(vecarr));
+            json_object_set_new(knn, "vector", varr);
             json_object_set_new(knn, "k", json_integer(k));
             json_t* knn_node = json_object();
             json_object_set_new(knn_node, "$knn", knn);
@@ -415,7 +388,6 @@ int main(int argc, char** argv) {
             Db db(default_conninfo());
             run_query(db, q, {}, true);
             json_decref(q);
-            json_decref(vecarr);
             return 0;
         }
         if (cmd == "import-records") {
@@ -429,8 +401,12 @@ int main(int argc, char** argv) {
             ro.prefix = opts.count("prefix") ? opts["prefix"] : "";
             ro.category = opts.count("category") ? opts["category"] : "";
             Db db(default_conninfo());
-            long n = import_records(db, ro);
-            std::cout << "{\"imported\":" << n << "}\n";
+            RecordsResult rr = import_records(db, ro);
+            json_t* o = json_object();
+            json_object_set_new(o, "imported", json_integer(rr.imported));
+            json_object_set_new(o, "skipped", json_integer(rr.skipped));
+            std::cout << json_dump(o) << std::endl;
+            json_decref(o);
             return 0;
         }
         if (cmd == "remember") {
@@ -441,7 +417,7 @@ int main(int argc, char** argv) {
             std::string key = memory_remember(db, opts.count("agent") ? opts["agent"] : "",
                                               opts.count("session") ? opts["session"] : "",
                                               opts.count("text") ? opts["text"] : "", about, tags);
-            std::cout << "{\"key\":\"" << key << "\"}\n";
+            print_kv("key", key);
             return 0;
         }
         if (cmd == "fact") {
@@ -450,7 +426,7 @@ int main(int argc, char** argv) {
                                           opts.count("topic") ? opts["topic"] : "",
                                           opts.count("value") ? opts["value"] : "null",
                                           opts.count("session") ? opts["session"] : "");
-            std::cout << "{\"key\":\"" << key << "\"}\n";
+            print_kv("key", key);
             return 0;
         }
         if (cmd == "link") {
@@ -481,7 +457,7 @@ int main(int argc, char** argv) {
                 db, opts.count("agent") ? opts["agent"] : "", opts.count("key") ? opts["key"] : "",
                 opts.count("meta") ? opts["meta"] : "{}", opts.count("content") ? opts["content"] : "{}",
                 opts.count("category") ? opts["category"] : "", opts.count("text") ? opts["text"] : "");
-            std::cout << "{\"key\":\"" << key << "\"}\n";
+            print_kv("key", key);
             return 0;
         }
         if (cmd == "export") {
@@ -501,7 +477,7 @@ int main(int argc, char** argv) {
             if (pos.size() < 2) return usage();
             Db db(default_conninfo());
             spec_set(db, pos[0], pos[1]);
-            std::cout << "{\"spec\":\"/spec/" << pos[0] << "\"}\n";
+            print_kv("spec", "/spec/" + pos[0]);
             return 0;
         }
         if (cmd == "seed") {
@@ -515,6 +491,7 @@ int main(int argc, char** argv) {
         json_t* err = json_object();
         json_object_set_new(err, "error", json_string(e.what()));
         std::cerr << json_dump(err) << std::endl;
+        json_decref(err);
         return 1;
     }
 }

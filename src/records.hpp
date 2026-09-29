@@ -13,5 +13,10 @@ struct RecordsOptions {
     std::string category;            // optional: validate against /spec/{category}
 };
 
+struct RecordsResult {
+    long imported{0};  // rows staged
+    long skipped{0};   // invalid json / missing key (reported, never silent)
+};
+
 // Generic importer: any JSONL/CSV -> knowledge entries.
-long import_records(Db& db, const RecordsOptions& opt);
+RecordsResult import_records(Db& db, const RecordsOptions& opt);

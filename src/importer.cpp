@@ -2,6 +2,7 @@
 
 #include "tokenize.hpp"
 #include "util.hpp"
+#include "write.hpp"
 
 #include <jansson.h>
 
@@ -96,12 +97,7 @@ std::string knowledge_row(const std::string& key, const std::string& meta, const
 
 void ensure_predicates(Db& db) {
     const char* preds[] = {P_CALLS, P_DEFINES, P_ASSIGNS, P_USES};
-    for (const char* p : preds) {
-        db.exec(
-            "INSERT INTO knowledge (key, meta, content, search_tsv) VALUES ($1, $2::jsonb, '{}'::jsonb, "
-            "to_tsvector('simple', $3)) ON CONFLICT (key) DO NOTHING",
-            {p, std::string(R"({"category":"predicate","name":")") + (p + 6) + R"("})", p + 6});
-    }
+    for (const char* p : preds) kwrite::ensure_predicate(db, p);
 }
 
 // Streams a top-level JSON object ("key": value, ...) entry by entry, so large
@@ -269,7 +265,7 @@ void import_analysis(Db& db, const ImportOptions& opt) {
         std::cerr << "[IMPORT] callee names: " << callee_names.size() << " (" << (now_s() - t0) << "s)\n";
     }
 
-    db.exec("BEGIN");
+    Db::Tx tx(db);
     db.exec("CREATE TEMP TABLE stg_knowledge(key text, meta text, content text, terms text) ON COMMIT DROP");
     db.exec("CREATE TEMP TABLE stg_statement(subject text, predicate text, object text) ON COMMIT DROP");
     ensure_predicates(db);
@@ -291,16 +287,21 @@ void import_analysis(Db& db, const ImportOptions& opt) {
         std::ifstream in(opt.analysis_dir + "/chunks_meta.jsonl");
         if (!in) throw std::runtime_error("[IMPORT] cannot open chunks_meta.jsonl");
         std::string line;
+        long skipped_chunks = 0;
         while (std::getline(in, line)) {
             if (line.empty()) continue;
             if (opt.limit > 0 && chunk_count >= opt.limit) break;
             json_error_t err;
             json_t* d = json_loads(line.c_str(), 0, &err);
-            if (!d) continue;
+            if (!d) {
+                skipped_chunks++;
+                continue;
+            }
 
             std::string name = jstr(d, "name");
             std::string file = jstr(d, "file");
             if (name.empty() || file.empty()) {
+                skipped_chunks++;
                 json_decref(d);
                 continue;
             }
@@ -320,9 +321,12 @@ void import_analysis(Db& db, const ImportOptions& opt) {
             }
         }
         std::cerr << "[IMPORT] chunks: " << chunk_count << " entries (" << (now_s() - t0) << "s)\n";
+        if (skipped_chunks > 0)
+            std::cerr << "[IMPORT] skipped chunks: " << skipped_chunks << " (invalid json or missing name/file)\n";
     }
 
     long edges = 0;
+    long bad_callgraph = 0, bad_dataflow = 0;
     std::string ebuffer;
     std::unordered_set<uint64_t> seen_edges;
     auto flush_e = [&]() {
@@ -357,7 +361,10 @@ void import_analysis(Db& db, const ImportOptions& opt) {
                 // skip them unless fan-out is explicitly requested.
                 if (it->second.size() > 1 && !opt.fanout) continue;
                 json_t* v = json_loads(value.c_str(), 0, nullptr);
-                if (!v) continue;
+                if (!v) {
+                    bad_callgraph++;
+                    continue;
+                }
                 const json_t* calls = json_object_get(v, "calls");
                 if (json_is_array(calls)) {
                     for (size_t i = 0; i < json_array_size(calls); ++i) {
@@ -384,7 +391,10 @@ void import_analysis(Db& db, const ImportOptions& opt) {
             std::string var, value;
             while (stream.next(var, value)) {
                 json_t* v = json_loads(value.c_str(), 0, nullptr);
-                if (!v) continue;
+                if (!v) {
+                    bad_dataflow++;
+                    continue;
+                }
                 std::string vkey = "/code/local/" + opt.project + "/vars/" + var;
                 stub_vars.emplace(vkey, var);
                 const json_t* occ = json_object_get(v, "occurrences");
@@ -444,7 +454,7 @@ void import_analysis(Db& db, const ImportOptions& opt) {
         "DROP INDEX IF EXISTS idx_knowledge_kind", "DROP INDEX IF EXISTS idx_knowledge_lang",
         "DROP INDEX IF EXISTS idx_knowledge_symbol", "DROP INDEX IF EXISTS idx_knowledge_file",
         "DROP INDEX IF EXISTS idx_knowledge_fti", "DROP INDEX IF EXISTS idx_knowledge_meta",
-        "DROP INDEX IF EXISTS idx_knowledge_emb",
+        "DROP INDEX IF EXISTS idx_knowledge_emb", "DROP INDEX IF EXISTS idx_knowledge_project",
         "DROP INDEX IF EXISTS idx_stmt_fwd", "DROP INDEX IF EXISTS idx_stmt_rev",
         "DROP INDEX IF EXISTS idx_stmt_pred",
     };
@@ -453,13 +463,8 @@ void import_analysis(Db& db, const ImportOptions& opt) {
     }
 
     double t_k = now_s();
-    db.exec(
-        "INSERT INTO knowledge (key, meta, content, search_tsv) "
-        "SELECT key, meta::jsonb, content::jsonb, "
-        "COALESCE(array_to_tsvector(string_to_array(NULLIF(terms, ''), ' ')), ''::tsvector) "
-        "FROM stg_knowledge "
-        "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
-        "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()");
+    kwrite::upsert_from_stage(
+        db, "COALESCE(array_to_tsvector(string_to_array(NULLIF(terms, ''), ' ')), ''::tsvector)");
     std::cerr << "[IMPORT] knowledge insert: " << (now_s() - t_k) << "s\n";
 
     double t_s = now_s();
@@ -469,7 +474,7 @@ void import_analysis(Db& db, const ImportOptions& opt) {
         "JOIN knowledge s ON s.key = t.subject "
         "JOIN knowledge p ON p.key = t.predicate "
         "JOIN knowledge o ON o.key = t.object "
-        "ON CONFLICT DO NOTHING");
+        "ON CONFLICT ON CONSTRAINT uq_stmt DO UPDATE SET is_archived = false, end_time = NULL");
     std::cerr << "[IMPORT] statement insert: " << (now_s() - t_s) << "s\n";
 
     if (bulk) {
@@ -494,6 +499,7 @@ void import_analysis(Db& db, const ImportOptions& opt) {
             "CREATE INDEX idx_knowledge_fti ON knowledge USING GIN (search_tsv) WHERE is_active",
             "CREATE INDEX idx_knowledge_meta ON knowledge USING GIN (meta jsonb_path_ops) WHERE is_active",
             "CREATE INDEX idx_knowledge_emb ON knowledge USING hnsw (embedding vector_cosine_ops)",
+            "CREATE INDEX idx_knowledge_project ON knowledge ((meta->>'project')) WHERE is_active",
             "CREATE INDEX idx_stmt_fwd ON statement (subject_id, predicate_id, object_id) WHERE is_active",
             "CREATE INDEX idx_stmt_rev ON statement (object_id, predicate_id, subject_id) WHERE is_active",
             "CREATE INDEX idx_stmt_pred ON statement (predicate_id) WHERE is_active",
@@ -504,7 +510,9 @@ void import_analysis(Db& db, const ImportOptions& opt) {
 
     db.exec("DROP TABLE stg_knowledge");
     db.exec("DROP TABLE stg_statement");
-    db.exec("COMMIT");
+    tx.commit();
+    if (bad_callgraph) std::cerr << "[IMPORT] call_graph.json: " << bad_callgraph << " entries skipped (invalid json)\n";
+    if (bad_dataflow) std::cerr << "[IMPORT] dataflow.json: " << bad_dataflow << " entries skipped (invalid json)\n";
     std::cerr << "[IMPORT] db load: " << (now_s() - t_load) << "s, total: " << (now_s() - t0) << "s\n";
     std::cerr << "[IMPORT] done\n";
 }

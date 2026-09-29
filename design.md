@@ -358,18 +358,26 @@ Agent 把本库当长期记忆。写入是**受控 Action**（本地 CLI），�
 Makefile              # 编译出单一二进制 knowledge
 schema.sql            # DDL（PG16）
 src/
-  util.hpp            # 公共工具（COPY 转义 / relpath / UTF-8 截断）
+  util.hpp            # 公共工具（COPY 转义 / relpath / UTF-8 截断 / json_ptr / escape_like / 类型取值）
   tokenize.hpp/.cpp   # 代码标识符分词器
   compile.hpp/.cpp    # JSE 校验 + 编译器（jansson + 参数化 SQL）
-  api.hpp/.cpp        # search / context 复用实现（CLI + HTTP）
-  server.hpp/.cpp     # HTTP API 服务（只读，连接池）
-  vector.hpp/.cpp     # 外挂向量引擎 provider 调用
-  importer.hpp/.cpp   # 代码知识导入器（chunks/call_graph/dataflow）
-  books.hpp/.cpp      # 电子书导入器（/opt/books 的 Markdown）
-  db.hpp/.cpp         # libpq 连接与查询
-  main.cpp            # CLI（tokenize / compile / query / search / context / import / import-books / seed）
-tools/                # ingest.sh（一键分析+入库）、vector_provider.sh、vector_provider_books.sh、vector_provider_stub.sh
-tests/smoke.sh        # 回归测试（编译器 + PG 端到端 + provider 健壮性），make test
+  write.hpp/.cpp      # 受控写助手：条件 upsert（version 仅内容变化 +1）/ ensure_predicate / link_edge(strict) / audit
+  shell.hpp/.cpp      # 子命令执行器（超时 + 输出上限，vector/embedder 共用）
+  api.hpp/.cpp        # search / context / paths 复用实现（CLI + HTTP）
+  server.hpp/.cpp     # HTTP API 服务（只读，连接池探活 + 读写超时）
+  vector.hpp/.cpp     # 外挂向量引擎 provider 调用 + embed_text（默认走 embed_query.sh）
+  importer.hpp/.cpp   # 代码知识导入器（chunks/call_graph/dataflow，事务 + 跳过计数）
+  books.hpp/.cpp      # 电子书导入器（/opt/books 的 Markdown，limit_hit 穿透）
+  records.hpp/.cpp    # 通用实体导入（JSONL/CSV，坏行跳过 + 绝对 key 不加前缀）
+  embed.hpp/.cpp      # 向量入库（.bin -> knowledge.embedding，返回 vectors/staged/matched）
+  spec.hpp/.cpp       # 规范条目（schema-as-data 校验）
+  action.hpp/.cpp     # 受控写 Action（put/forget/restore/link + 审计）
+  memory.hpp/.cpp     # Agent 记忆写 Action（remember/fact/link/forget）
+  export.hpp/.cpp     # 训练语料导出（edges/context preset，稳定序 + 批量去 N+1）
+  db.hpp/.cpp         # libpq 连接与查询（类型映射 value_to_json / Db::Tx 事务 / healthy 探活）
+  main.cpp            # CLI（tokenize / compile / query / search / context / import / import-books / seed / serve ...）
+tools/                # ingest.sh（一键分析+入库）、vector_provider.sh、vector_provider_books.sh、vector_provider_stub.sh、embed_query.sh
+tests/smoke.sh        # 回归测试（编译器 + PG 端到端 + provider 健壮性 + 写完整性 + HTTP），make test
 prompts/              # 向 Google AI 提问的三弹材料 + 统一 brief
 README.md             # 快速上手
 design.md             # 本文档
@@ -410,7 +418,7 @@ design.md             # 本文档
 - [x] **token 友好输出**：`meta`/`content` 返回嵌套对象（不再双重转义）；`search` 默认回 `key/symbol/file/line/signature/score`；`context` 支持 `--no-content` / `--max-code-bytes`
 - [x] **电子书输入源**：`knowledge import-books`，`/opt/books/{book}/chapters/**/page_*.md` → book/chapter/page 条目 + `contains` 关系；`tools/vector_provider_books.sh` 接入 book 向量（key 与 `cache_query` 的 `name` 天然对齐）
 - [x] **代码复盘加固**：修复 `$search_score` 无 `$search` 的非法 SQL；拒绝一个节点含多个算子；`$triple` 增加 `direction`（out/in/both）且语义修正；provider 容忍杂音输出；公共工具抽到 `src/util.hpp`；书籍正文不再整页写入 `search_tsv`（截断 4KB）
-- [x] **回归测试**：`tests/smoke.sh` + `make test`（编译器 + PG 端到端 + provider 健壮性，16 项）
+- [x] **回归测试**：`tests/smoke.sh` + `make test`（编译器 + PG 端到端 + provider 健壮性 + 写完整性 + HTTP，63 项）
 - [x] **编译期 key→id 解析**：`CompileOptions::resolve_key`，已知 key 直接产出整数 id 字面量（省去每个条件的子查询），未命中回退子查询
 - [x] **`$k-hop` 结果上限**：递归子查询尾部 `LIMIT 20000`，防扇出爆炸
 - [x] **混合检索（RRF）**：`search` = 向量候选 + 全文候选（`$fti` + `$fti_rank`），RRF 融合后过标量过滤；结果带 `rrf/vector_rank/lexical_rank/vector_score`
@@ -439,6 +447,14 @@ design.md             # 本文档
 - [x] **规范条目校验（schema-as-data）**：`spec-set` 定义 `/spec/{category}`；`put` / `import-records --category` 写入前校验，批量违反整批回滚
 - [x] **Action 全面化**：统一审计（`/audit/{agent}/...` + `about` 边）；通用受控写 `put`；`forget`/`restore`（归档/恢复）；`link` 纳入审计
 - [x] **Makefile 依赖跟踪**：`-MMD -MP` + `-include *.d`（此前改头文件不重编导致链接错误）
+- [x] **代码复盘全面加固（2026-09-30，P0/P1/P2 全清）**
+      - 新增共享模块：`src/shell.*`（子命令超时/输出上限）、`src/write.*`（条件 upsert / 严格 link / 审计）；`util.hpp` 补 `json_ptr/now_iso/escape_like/...` 消除三处重复实现
+      - DB 层：`Db::Tx` RAII 事务（put/remember/importer/books/records/embed/seed 全部事务化）、`value_to_json` 按 PQftype 输出原生数字/JSON、连接池探活重建、全局 `statement_timeout`
+      - 编译器：数值比较守卫（不再文本→numeric 报错）、`$prefix` 字面量转义（`ESCAPE '\'`）、`$knn` 子查询/重复拒绝、`$knn_distance` 投影、`$offset` 钳制、`$project` 原生 JSON 类型、子查询内不再解析 key
+      - 检索：`api_search` embed 失败退化纯全文（无 GPU 不崩）、候选 3×k 过采样、`k` 钳制 1..1000、`vector_score=1-余弦距离`；`context` 恒含 `related`、`depth` 钳制 0..5、paths LIMIT 500 + `paths_truncated`
+      - 写侧：version **内容变化才 +1**（幂等写）、`link`/`remember --about` 端点缺失报错回滚、`import-records` 坏行跳过计数 + 绝对 key 不加前缀、`export` 稳定序 + 字面前缀 + 批量去 N+1
+      - HTTP：`exclude_headers` 参数、负 k/大 depth 钳制、非法 JSE 400、60s 读写超时
+      - 测试 35 → 63 项；`make debug` / `make asan` 构建 target（ASan 下全量冒烟 + 21 条错误路径 0 泄漏）
 
 ### 进行中 🚧
 
@@ -503,3 +519,21 @@ design.md             # 本文档
 | 2026-09-29 | 低 | CSV 导入 CRLF 末列带 `\r` | 逐行 strip CR |
 | 2026-09-29 | 低 | Makefile 不跟踪头文件依赖，改头文件不重编导致链接错误 | `-MMD -MP` + `-include *.d` |
 | 2026-09-29 | 低 | `$search_score` / `$fti_rank` 缺前置算子时生成非法 SQL | 编译期显式报错 |
+| 2026-09-30 | **高** | HTTP `/search?k=-5` 崩溃（`std::vector` 下溢）、`k=abc` 静默 0 | `k` 统一钳制 1..1000（CLI/HTTP 同路径） |
+| 2026-09-30 | **高** | `$meta` 数值右值 vs 文本列报 `invalid input syntax for type numeric` | 数值守卫（数字文本才比较；`$ne`/`$nin` 语义 = 非数字也匹配） |
+| 2026-09-30 | **高** | `$prefix` 含 `_`/`%` 被当通配符（`a_1` 命中 `ax1`；export 前缀同 bug） | 编译器转义 + `ESCAPE '\'`；export 改 `starts_with`（字面量） |
+| 2026-09-30 | **高** | 写路径全程无事务：校验失败/端点缺失留下半条记录与孤儿边 | `Db::Tx` 覆盖 put/remember/link/审计/全部导入器 |
+| 2026-09-30 | **高** | version 无条件 +1（重复幂等写膨胀版本） | upsert 加 `WHERE ... IS DISTINCT FROM ...` 条件，仅内容变化才 +1 |
+| 2026-09-30 | **高** | `link`/`remember --about` 端点不存在静默成功（0 行更新） | 严格端点校验，报 `[LINK] ...` 并回滚；审计内 link 仍宽松 |
+| 2026-09-30 | **高** | 无 embed 时 `search`/`qsearch`/`context.related` 崩溃或空 | `api_search` embed 失败退化纯全文；`related` 恒返回（vector→pgvector→[]） |
+| 2026-09-30 | 中 | `$knn` 可进子查询/`$k-hop.where`（生成乱序非法 SQL）、重复出现 | 编译期拒绝，HTTP 400 `[JSE]` |
+| 2026-09-30 | 中 | `$project meta.line` 输出字符串 `"312"`（调用方要 `312`） | 行根 `id/version`、`meta.*`、`content.*` 按 PQftype/JSONB 输出原生类型 |
+| 2026-09-30 | 中 | HTTP 连接池拿到死连接不重建（可能死锁/缩水） | 取连接探活并重建；探活失败回传坏连接保不缩水 |
+| 2026-09-30 | 中 | `export --preset context` N+1（每个 key 三次查询），顺序不稳定 | keys→`id=ANY` 批量 definitions/edges + `api_paths`；稳定序，重复导出字节一致 |
+| 2026-09-30 | 中 | `import-records` 坏行整批崩溃；绝对 key 被双重加前缀 | 行级跳过 + `{"imported","skipped"}` 计数；绝对 key 原样保留 |
+| 2026-09-30 | 中 | HTTP `depth=99` 全表路径查询；`paths` 无上限 | `depth` 钳制 0..5；paths `LIMIT 500` + `paths_truncated` |
+| 2026-09-30 | 中 | main.cpp 手拼 JSON（未转义即坏输出） | 统一 jansson `print_kv`；`compile` 惰性连库（DB 不可达降级为子查询） |
+| 2026-09-30 | 低 | `vector.cpp`/`main.cpp` 两套 popen 执行器；供应商挂死拖垮请求 | 统一 `ksh::run`（60s 超时 / 16MB 上限，可环境变量覆盖） |
+| 2026-09-30 | 低 | `memory_forget` 死代码、`skip` 计数不报、`import-vectors` 不计改动 | 删除死函数；`skipped`/`staged`/`matched` 计数输出 |
+| 2026-09-30 | 中 | `put`/导入写到**已归档**条目后仍不可见（`is_active` 保持 false，静默吞写） | 显式写即复活：`is_archived=false, end_time=NULL`（4 处 upsert SQL 收敛到 `kwrite::UPSERT_CONFLICT`）；version 仍仅内容变化 +1 |
+| 2026-09-30 | 中 | 顶层错误处理构造错误 JSON 后未释放（所有 CLI 报错路径泄漏 ~351B） | `json_decref(err)`（ASan 发现） |

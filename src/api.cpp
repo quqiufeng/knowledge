@@ -1,5 +1,6 @@
 #include "api.hpp"
 
+#include "util.hpp"
 #include "vector.hpp"
 
 #include <algorithm>
@@ -21,7 +22,7 @@ std::function<bool(const std::string&, long long&)> make_resolver(
         bool found = json_array_size(rows) > 0;
         if (found) {
             const json_t* v = json_object_get(json_array_get(rows, 0), "id");
-            id = std::atoll(json_string_value(v));
+            id = kutil::json_as_int(v);
             cache[key] = id;
         }
         json_decref(rows);
@@ -39,22 +40,57 @@ CompileOptions make_options(Db& db, const std::vector<VectorHit>& vectors,
 
 namespace {
 
-std::string pg_array_literal(const std::vector<std::string>& items) {
-    std::string out = "{";
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (i) out += ",";
-        out += '"';
-        for (char c : items[i]) {
-            if (c == '"' || c == '\\') out += '\\';
-            out += c;
-        }
-        out += '"';
+json_t* knn_candidate_query(const std::vector<float>& qvec, int k, const std::string& scalar_json) {
+    json_error_t err;
+    json_t* varr = json_array();
+    for (float f : qvec) json_array_append_new(varr, json_real(f));
+    json_t* knn = json_object();
+    json_object_set_new(knn, "vector", varr);
+    json_object_set_new(knn, "k", json_integer(k));
+    json_t* knn_node = json_object();
+    json_object_set_new(knn_node, "$knn", knn);
+    json_t* and_arr = json_array();
+    json_array_append_new(and_arr, knn_node);
+    if (!scalar_json.empty()) {
+        json_t* extra = json_loads(scalar_json.c_str(), 0, &err);
+        if (!extra) throw std::runtime_error(std::string("[INPUT] invalid scalar JSE: ") + err.text);
+        json_array_append_new(and_arr, extra);
     }
-    out += "}";
-    return out;
+    json_t* inner = json_object();
+    json_object_set_new(inner, "$and", and_arr);
+    json_t* q = json_object();
+    json_object_set_new(q, "$where", inner);
+    json_t* proj = json_array();
+    json_array_append_new(proj, json_string("key"));
+    json_array_append_new(proj, json_string("$knn_distance"));
+    json_object_set_new(q, "$project", proj);
+    json_object_set_new(q, "$limit", json_integer(k));
+    return q;
 }
 
-void trim_definition(json_t* defs, bool no_content, long max_bytes) {
+std::vector<VectorHit> pgvector_candidates(Db& db, const std::vector<float>& qvec, int k,
+                                           const std::string& scalar_json,
+                                           std::unordered_map<std::string, long long>& cache) {
+    json_t* q = knn_candidate_query(qvec, k, scalar_json);
+    CompiledQuery cq = compile_query(q, make_options(db, {}, cache));
+    json_decref(q);
+    json_t* vrows = db.query_json(cq.sql, cq.params);
+    std::vector<VectorHit> hits;
+    for (size_t i = 0; i < json_array_size(vrows); ++i) {
+        json_t* row = json_array_get(vrows, i);
+        const json_t* rk = json_object_get(row, "key");
+        if (!json_is_string(rk)) continue;
+        // Cosine similarity = 1 - distance (distance itself orders the row).
+        double dist = kutil::json_as_num(json_object_get(row, "$knn_distance"), 1.0);
+        hits.push_back(VectorHit{json_string_value(rk), 1.0 - dist});
+    }
+    json_decref(vrows);
+    return hits;
+}
+
+}  // namespace
+
+void api_trim_definition(json_t* defs, bool no_content, long max_bytes) {
     const char* text_fields[] = {"code", "text"};
     for (size_t i = 0; i < json_array_size(defs); ++i) {
         json_t* content = json_object_get(json_array_get(defs, i), "content");
@@ -76,48 +112,56 @@ void trim_definition(json_t* defs, bool no_content, long max_bytes) {
     }
 }
 
-}  // namespace
+json_t* api_paths(Db& db, const std::string& key, int depth, const std::string& pred_key) {
+    if (depth <= 0) return json_array();
+    if (depth > 5) depth = 5;
+    std::string preds = kutil::pg_text_array({pred_key});
+    json_t* rows = db.query_json(
+        "WITH RECURSIVE chain AS ("
+        " SELECT k.id AS cur, 0 AS depth, ARRAY[k.id] AS ids, ARRAY[k.key]::text[] AS keys"
+        " FROM knowledge k WHERE k.key = $1 AND k.is_active"
+        " UNION ALL"
+        " SELECT st.object_id, c.depth + 1, c.ids || st.object_id, c.keys || ok.key"
+        " FROM chain c JOIN statement st ON st.subject_id = c.cur"
+        " JOIN knowledge ok ON ok.id = st.object_id"
+        " WHERE c.depth < $2::int AND st.is_active"
+        "   AND st.predicate_id IN (SELECT id FROM knowledge WHERE key = ANY($3::text[]))"
+        "   AND NOT (st.object_id = ANY(c.ids))"
+        ") SELECT depth, keys FROM chain WHERE depth > 0 ORDER BY depth, keys"
+        " LIMIT " + std::to_string(api_paths_limit),
+        {key, std::to_string(depth), preds});
+    return rows;
+}
 
 json_t* api_search(Db& db, const std::string& query, int k, const std::string& vector_cmd,
-                   const std::string& scalar_json, const std::vector<float>& qvec) {
+                   const std::string& scalar_json, const std::vector<float>& qvec_in,
+                   const std::string& embed_cmd) {
+    if (k < 1) k = 1;
+    if (k > 1000) k = 1000;
+    // Over-fetch candidates: a scalar filter can drop vector/lexical hits below k.
+    const int cand = std::min(1000, k * 3);
+
     json_error_t err;
     std::unordered_map<std::string, long long> cache;
+    std::vector<float> qvec = qvec_in;
     std::vector<VectorHit> hits;
+    bool have_vectors = false;
 
     if (!qvec.empty()) {
-        // pgvector path: vector candidates from the DB itself.
-        json_t* varr = json_array();
-        for (float f : qvec) json_array_append_new(varr, json_real(f));
-        json_t* knn = json_object();
-        json_object_set_new(knn, "vector", varr);
-        json_object_set_new(knn, "k", json_integer(k));
-        json_t* knn_node = json_object();
-        json_object_set_new(knn_node, "$knn", knn);
-        json_t* and_arr = json_array();
-        json_array_append_new(and_arr, knn_node);
-        if (!scalar_json.empty()) {
-            json_t* extra = json_loads(scalar_json.c_str(), 0, &err);
-            if (!extra) throw std::runtime_error(std::string("[INPUT] invalid scalar JSE: ") + err.text);
-            json_array_append_new(and_arr, extra);
-        }
-        json_t* inner = json_object();
-        json_object_set_new(inner, "$and", and_arr);
-        json_t* q = json_object();
-        json_object_set_new(q, "$where", inner);
-        json_t* proj = json_array();
-        json_array_append_new(proj, json_string("key"));
-        json_object_set_new(q, "$project", proj);
-        json_object_set_new(q, "$limit", json_integer(k));
-        CompiledQuery cq = compile_query(q, make_options(db, {}, cache));
-        json_t* vrows = db.query_json(cq.sql, cq.params);
-        for (size_t i = 0; i < json_array_size(vrows); ++i) {
-            const json_t* rk = json_object_get(json_array_get(vrows, i), "key");
-            if (json_is_string(rk)) hits.push_back(VectorHit{json_string_value(rk), 0.0});
-        }
-        json_decref(vrows);
-        json_decref(q);
+        have_vectors = true;
+    } else if (!vector_cmd.empty()) {
+        hits = run_vector_provider(vector_cmd, query, cand);
+        have_vectors = !hits.empty();
     } else {
-        hits = run_vector_provider(vector_cmd, query, k);
+        try {
+            qvec = embed_text(query, embed_cmd);
+            have_vectors = !qvec.empty();
+        } catch (...) {
+            qvec.clear();  // no embedder -> fall back to lexical-only
+        }
+    }
+    if (have_vectors && !qvec.empty()) {
+        hits = pgvector_candidates(db, qvec, cand, scalar_json, cache);
     }
 
     std::vector<std::string> lex_keys;
@@ -132,7 +176,7 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
         json_t* lorder = json_object();
         json_object_set_new(lorder, "$fti_rank", json_string("desc"));
         json_object_set_new(lq, "$order", lorder);
-        json_object_set_new(lq, "$limit", json_integer(k));
+        json_object_set_new(lq, "$limit", json_integer(cand));
         CompiledQuery lc = compile_query(lq, make_options(db, {}, cache));
         json_t* lrows = db.query_json(lc.sql, lc.params);
         for (size_t i = 0; i < json_array_size(lrows); ++i) {
@@ -173,7 +217,7 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
     json_t* out = json_object();
     json_object_set_new(out, "query", json_string(query.c_str()));
     if (fused.empty()) {
-        json_object_set_new(out, "source", json_string("none"));
+        json_object_set_new(out, "source", json_string(have_vectors ? "pgvector+fti" : "pg+fti"));
         json_object_set_new(out, "results", json_array());
         return out;
     }
@@ -229,7 +273,8 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
         if (vs != vscore.end()) json_object_set_new(row, "vector_score", json_real(vs->second));
     }
 
-    const char* source = !qvec.empty() ? "pgvector+fti" : (vector_cmd.empty() ? "pg+fti" : "vector+fti");
+    const char* source =
+        have_vectors ? "pgvector+fti" : (vector_cmd.empty() ? "pg+fti" : "vector+fti");
     json_object_set_new(out, "source", json_string(source));
     json_object_set_new(out, "results", rows);
     return out;
@@ -238,6 +283,11 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
 json_t* api_context(Db& db, const std::string& key, int depth, int k, const std::string& pred_key,
                     const std::string& vector_cmd, bool no_content, long max_bytes,
                     bool exclude_headers) {
+    if (depth < 0) depth = 0;
+    if (depth > 5) depth = 5;  // deeper walks explode; callers must not be able to force them
+    if (k < 1) k = 1;
+    if (k > 1000) k = 1000;
+
     json_t* bundle = json_object();
     json_object_set_new(bundle, "key", json_string(key.c_str()));
 
@@ -248,11 +298,11 @@ json_t* api_context(Db& db, const std::string& key, int depth, int k, const std:
         json_decref(bundle);
         throw std::runtime_error("[CONTEXT] key not found or inactive: " + key);
     }
-    trim_definition(defs, no_content, max_bytes);
+    api_trim_definition(defs, no_content, max_bytes);
     json_object_set_new(bundle, "definition", defs);
 
     json_t* idrows = db.query_json("SELECT id FROM knowledge WHERE key = $1", {key});
-    std::string id = json_string_value(json_object_get(json_array_get(idrows, 0), "id"));
+    std::string id = std::to_string(kutil::json_as_int(json_object_get(json_array_get(idrows, 0), "id")));
     json_decref(idrows);
 
     std::string hdr = exclude_headers ? " AND k.meta->>'file' NOT LIKE 'include/%'" : "";
@@ -268,57 +318,63 @@ json_t* api_context(Db& db, const std::string& key, int depth, int k, const std:
                       {id}));
 
     if (depth > 0) {
-        std::string preds = pg_array_literal({pred_key});
-        json_object_set_new(
-            bundle, "paths",
-            db.query_json(
-                "WITH RECURSIVE chain AS ("
-                " SELECT k.id AS cur, 0 AS depth, ARRAY[k.id] AS ids, ARRAY[k.key]::text[] AS keys"
-                " FROM knowledge k WHERE k.key = $1 AND k.is_active"
-                " UNION ALL"
-                " SELECT st.object_id, c.depth + 1, c.ids || st.object_id, c.keys || ok.key"
-                " FROM chain c JOIN statement st ON st.subject_id = c.cur"
-                " JOIN knowledge ok ON ok.id = st.object_id"
-                " WHERE c.depth < $2::int AND st.is_active"
-                "   AND st.predicate_id IN (SELECT id FROM knowledge WHERE key = ANY($3::text[]))"
-                "   AND NOT (st.object_id = ANY(c.ids))"
-                ") SELECT depth, keys FROM chain WHERE depth > 0 ORDER BY depth, keys",
-                {key, std::to_string(depth), preds}));
+        json_t* paths = api_paths(db, key, depth, pred_key);
+        if (json_array_size(paths) >= (size_t)api_paths_limit)
+            json_object_set_new(bundle, "paths_truncated", json_true());
+        json_object_set_new(bundle, "paths", paths);
     }
 
+    // related: always present. External provider if configured, else pgvector via
+    // the embedder; failures degrade to an empty array, never to a missing field.
+    std::vector<VectorHit> rel;
+    const json_t* meta0 = json_object_get(json_array_get(defs, 0), "meta");
+    std::string qtext = key;
+    if (json_is_object(meta0)) {
+        const json_t* s = json_object_get(meta0, "symbol");
+        if (json_is_string(s) && json_string_value(s)[0]) qtext = json_string_value(s);
+    }
     if (!vector_cmd.empty()) {
-        json_t* symbol_v = json_object_get(json_array_get(defs, 0), "meta");
-        std::string symbol;
-        if (json_is_object(symbol_v)) {
-            const json_t* s = json_object_get(symbol_v, "symbol");
-            if (json_is_string(s)) symbol = json_string_value(s);
+        try {
+            rel = run_vector_provider(vector_cmd, qtext, k + 1);
+        } catch (...) {
+            rel.clear();
         }
-        std::vector<VectorHit> hits = run_vector_provider(vector_cmd, symbol.empty() ? key : symbol, k);
-        std::vector<VectorHit> filtered;
-        for (const auto& h : hits)
-            if (h.key != key) filtered.push_back(h);
-
-        if (!filtered.empty()) {
-            std::string values;
-            std::vector<std::string> params;
-            for (size_t i = 0; i < filtered.size(); ++i) {
-                if (i) values += ", ";
-                std::string kp = "$" + std::to_string(params.size() + 1);
-                params.push_back(filtered[i].key);
-                std::string sp = "$" + std::to_string(params.size() + 1);
-                params.push_back(std::to_string(filtered[i].score));
-                values += "(" + kp + "::text, " + sp + "::double precision)";
+    } else {
+        try {
+            std::vector<float> qvec = embed_text(qtext);
+            if (!qvec.empty()) {
+                std::unordered_map<std::string, long long> rel_cache;
+                rel = pgvector_candidates(db, qvec, k + 1, "", rel_cache);
             }
-            json_object_set_new(
-                bundle, "related",
-                db.query_json(
-                    "WITH vs(key, score) AS (VALUES " + values + ") "
-                    "SELECT k.key, k.meta, vs.score FROM vs JOIN knowledge k ON k.key = vs.key "
-                    "WHERE k.is_active ORDER BY vs.score DESC",
-                    params));
-        } else {
-            json_object_set_new(bundle, "related", json_array());
+        } catch (...) {
+            rel.clear();
         }
+    }
+    std::vector<VectorHit> filtered;
+    for (const auto& h : rel)
+        if (h.key != key) filtered.push_back(h);
+    if (filtered.size() > (size_t)k) filtered.resize(k);
+
+    if (!filtered.empty()) {
+        std::string values;
+        std::vector<std::string> params;
+        for (size_t i = 0; i < filtered.size(); ++i) {
+            if (i) values += ", ";
+            std::string kp = "$" + std::to_string(params.size() + 1);
+            params.push_back(filtered[i].key);
+            std::string sp = "$" + std::to_string(params.size() + 1);
+            params.push_back(std::to_string(filtered[i].score));
+            values += "(" + kp + "::text, " + sp + "::double precision)";
+        }
+        json_object_set_new(
+            bundle, "related",
+            db.query_json(
+                "WITH vs(key, score) AS (VALUES " + values + ") "
+                "SELECT k.key, k.meta, vs.score FROM vs JOIN knowledge k ON k.key = vs.key "
+                "WHERE k.is_active ORDER BY vs.score DESC",
+                params));
+    } else {
+        json_object_set_new(bundle, "related", json_array());
     }
 
     return bundle;

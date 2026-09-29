@@ -3,10 +3,6 @@
 
 #include <string>
 
-// Append an audit entry /audit/{agent}/{ts}-{pid}-{seq} and link it to the target.
-std::string audit(Db& db, const std::string& agent, const std::string& action,
-                  const std::string& target, const std::string& detail_json);
-
 // Action: validated upsert of an entry (optionally against /spec/{category}).
 std::string action_put(Db& db, const std::string& agent, const std::string& key,
                        const std::string& meta_json, const std::string& content_json,

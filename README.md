@@ -229,7 +229,6 @@ third_party/httplib.h # vendored header-only HTTP 库（MIT）
 tools/ingest.sh               # 一键流水线：代码分析 + 入库
 tools/vector_provider.sh      # 代码向量引擎适配器（my_db cache_query）
 tools/vector_provider_books.sh# 电子书向量引擎适配器（my_db book cache）
-tools/vector_provider_books.sh# 电子书向量适配器
 tools/embed_query.sh          # 查询文本 -> 768 维向量（my_db Jina）
 tools/vector_provider_stub.sh # 测试用 stub
 prompts/              # 向 Google AI 提问的三弹材料 + 统一 brief
@@ -256,7 +255,7 @@ make
 # 5. 查询（JSE 从 stdin）
 echo '{"$where":{"$and":[{"$meta":{"path":"kind","$eq":"function"}},{"$fti":"page_alloc"}]},"$project":["key","meta.symbol"],"$limit":20}' | ./knowledge query
 
-# 6. 只编译看 SQL（不连库）
+# 6. 只编译看 SQL（库可达时顺带解析 key->id，不可达则自动降级为子查询）
 echo '{"$where":{"$fti":"page_alloc"}}' | ./knowledge compile
 
 # 7. 分词
@@ -271,7 +270,9 @@ export ANALYSIS_DIR=/opt/code_caches/redis_cache PROJECT=redis ROOT=/opt/redis
 ./knowledge context /code/local/redis/src/module.c/RM_PoolAlloc --depth 2
 
 # 10. 回归测试
-make test
+make test        # 冒烟（编译器/查询/记忆/HTTP）
+make debug       # -O0 调试构建（gdb）
+make asan        # ASan+UBSan 构建（内存/UB 回归）
 ```
 
 连接串通过 `DATABASE_URL` 覆盖，默认 `postgres://knowledge:knowledge@127.0.0.1:5432/knowledge`。
@@ -391,15 +392,21 @@ export KNOWLEDGE_VECTOR_CMD="./tools/vector_provider_books.sh"
 
 - `definition`：完整源码 / 正文（不截断）+ 元数据 + 版本
 - `callers` / `callees`：直接关系（代码为 `calls`，书籍为 `contains`）
-- `paths`：关系路径的**节点序列**（从起点到终点），带深度
-- `related`：**语义搜索近邻**（来自外挂向量引擎，按 score 降序）
+- `paths`：关系路径的**节点序列**（从起点到终点），带深度；行数上限 500，触顶时附带 `"paths_truncated": true`
+- `related`：**语义搜索近邻**（按 score 降序）。**总是返回**：优先外挂向量引擎，
+  否则用 `KNOWLEDGE_EMBED_CMD` 嵌入后走 pgvector；两者都不可用时为 `[]`
+- `--depth` 被钳制在 0..5（0 = 不取 paths）；`--k` 钳制在 1..1000
 
-### `knowledge search <query> [--k N] [--where <jse>] [--vector-cmd <cmd>]`
+### `knowledge search <query> [--k N] [--where <jse>] [--vector-cmd <cmd>] [--embed-cmd <cmd>]`
 
 混合检索：向量候选 + 全文候选（`$fti`）→ **RRF 融合** → PG 标量过滤。
-- **默认**：`embed_query.sh` 嵌入查询 → **pgvector `$knn`**（PG 内），`source=pgvector+fti`
+- **默认**：`embed_query.sh` 嵌入查询 → **pgvector `$knn`**（PG 内），`source=pgvector+fti`；
+  嵌入失败（无 GPU/未配置）时自动退化为纯全文，`source=pg+fti`，不报错
 - **`--vector-cmd`**：改用外挂引擎，`source=vector+fti`
-- 结果带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`，便于判断命中来源。
+- 候选按 `3×k` 过采样再融合，缓解"标量过滤把候选滤空"的问题
+- 结果带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`
+  （pgvector 路径下 `vector_score = 1 - 余弦距离`，即余弦相似度）
+- `--k` 钳制在 1..1000（负数/0 不再崩溃）
 
 ### 向量引擎接入（provider 契约）
 
@@ -414,6 +421,9 @@ export KNOWLEDGE_VECTOR_CMD="./tools/vector_provider_books.sh"
 ```
 key = /code/local/{project}/{file-relative-to-root}/{symbol}
 ```
+
+> provider/embedder 子命令有**超时与输出上限**（默认 60s / 16MB，可用
+> `KNOWLEDGE_CMD_TIMEOUT_S`、`KNOWLEDGE_CMD_MAX_BYTES` 覆盖），挂死的引擎会被 kill 而不是拖住请求。
 
 例：`ANALYSIS_DIR=/opt/code_caches/redis_cache PROJECT=redis ROOT=/opt/redis` 时，
 `/opt/redis/src/module.c` 的 `RM_PoolAlloc` → `/code/local/redis/src/module.c/RM_PoolAlloc`。
@@ -445,6 +455,10 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 - **schema-as-data**：`/spec/{category}` 定义 `{"required":[...],"types":{...}}`；`put` / `import-records` 写入前校验。
 - **统一审计**：每个 Action 追加 `/audit/{agent}/{ts}-{pid}-{seq}`，带 `meta.action` / `meta.target`，并建 `about` 边指向目标。
 - **可回溯**：写是 upsert + 版本号，删除是归档，均可 restore。
+- **version 语义**：**内容变化才 +1**（meta/content/search_tsv 三者任一变化；重复写入同一内容 version 不动，可做幂等写）。
+- **写即复活**：对已归档条目执行 `put` 或重新导入，会把它恢复为活跃状态（无需先 `restore`）；纯归档→活跃用 `restore`（不改内容）。
+- **失败即回滚**：校验不过、关系端点不存在等错误会使整个事务回滚，不留半条记录
+  （`link` 两端不存在会明确报 `[LINK] edge endpoints do not exist: ...`；`remember --about` 同理）。
 
 于是"本体住在库里、写入受约束、变更可审计"——从"宽松底座"升级为"受约束的结构化本体"。
 
@@ -461,6 +475,9 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 
 - 任意结构化数据 → 条目；顶层标量字段进 `meta`（可 `$meta` 过滤），整条进 `content.value`
   （或 `--text-field F` 时该字段作为 `content.text` 并参与全文）。
+- 行级容错：坏 JSON / 缺 `key` 字段的行**跳过不中断**，输出 `{"imported":N,"skipped":M,"keys":[...]}`；
+  规范校验（`--category`）不过则**整批回滚**。
+- `--prefix` 只作用于**相对 key**；条目自带绝对 key（以 `/` 开头）时原样保留，不会被双重加前缀。
 - 至此"知识底座"不再只吃 my_db 产物，任何 JSONL/CSV 都能进库并统一查询。
 
 ## 向量进 PG（pgvector）
@@ -479,8 +496,11 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 ```
 
 - `$knn` 算子：`{"$knn":{"vector":[...],"k":N}}` → `ORDER BY embedding <=> $vec`。
+  - 只能出现在**最外层**（子查询 / `$k-hop.where` 内会报 `[JSE]`），且一个查询只能出现一次
+  - 投影可用 `"$project":["key","$knn_distance"]` 输出距离值
 - 查询文本→向量：`tools/embed_query.sh`（复用 my_db Jina 模型，GPU）。
 - 实测：redis 10658 向量入库，qsearch 结果与外挂引擎一致（`RM_PoolAlloc` 等）。
+- HNSW + 强标量过滤时，候选池不足可能返回少于 k 条（正常现象，可用 `k` 放大候选）。
 
 ---
 
@@ -507,8 +527,8 @@ export KNOWLEDGE_VECTOR_CMD=./tools/vector_provider.sh
 | `GET /health` | `{"status":"ok"}` |
 | `GET /stats` | knowledge / statement / active 计数 |
 | `POST /jse` | body 为 JSE 查询（可带 `"$vectors":[...]` 供 `$search`） |
-| `GET /search?q=&k=&where=` | 混合检索 |
-| `GET /context?key=&depth=&k=&predicate=&no_content=&max_code_bytes=` | 上下文包 |
+| `GET /search?q=&k=&where=` | 混合检索（`k` 钳制 1..1000） |
+| `GET /context?key=&depth=&k=&predicate=&no_content=&max_code_bytes=&exclude_headers=` | 上下文包（`depth` 钳制 0..5） |
 
 ```bash
 curl -s -X POST localhost:8931/jse \
@@ -517,8 +537,9 @@ curl -s 'localhost:8931/search?q=memory%20pool&k=5'
 curl -s -G 'localhost:8931/context' --data-urlencode 'key=/code/local/redis/src/module.c/RM_PoolAlloc' --data 'depth=2'
 ```
 
-限制：请求体 ≤ 1MB、每请求 `statement_timeout=30s`、`$limit` ≤ 1000、`$k-hop` depth ≤ 5；
-只读角色在数据库层禁止任何写操作。
+限制：请求体 ≤ 1MB、每请求 `statement_timeout=30s`、读写超时 60s、`$limit` ≤ 1000、`$k-hop` depth ≤ 5；
+非法参数（如 `$knn` 进 `$k-hop.where`）返回 400 + `[JSE] ...` 结构化错误；
+连接池每次取连接先探活并重建坏连接；只读角色在数据库层禁止任何写操作。
 
 ### 写侧安全：局域网 SSH + key（推荐）
 
@@ -577,7 +598,11 @@ Agent 可以把本库当**长期记忆/大脑**：自主写入与检索。写入
 ```
 
 - `--no-content` / `--depth` 控制记录体量与 token 开销。
-- 输出逐行 JSON（JSONL），可直接接 SFT / 指令数据管线。
+- 输出逐行 JSON（JSONL），**顺序稳定**（edges 按 statement id，context 按 key），
+  同库重复导出字节一致；`--key-prefix` 是**字面量**匹配（`a_1` 不会命中 `ax1`）。
+- `context` preset 为批量 SQL（definitions/edges 各一次 `id=ANY(...)` 取回），
+  **不含 `related`**（避免逐条嵌入），每个键一条记录：`definition` + `callers` + `callees` + `paths`。
+- 可直接接 SFT / 指令数据管线。
 - 价值：给模型**精确的类型定义、调用/依赖上下文、数据流、可追溯来源**，而不是让它猜。
 
 > 定位提醒：导出的是**上下文与监督信号**，仍需套一层任务模板（NL→代码、补全、问答、代码审查）；
@@ -589,19 +614,27 @@ Agent 可以把本库当**长期记忆/大脑**：自主写入与检索。写入
 
 - `$and` / `$or` / `$not`
 - `$meta`：`path` + `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$like/$ilike/$prefix`
+  - 数值语义守卫：右值是数值、左值是文本时先匹配 `^-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$` 再比较，
+    不再触发 PG 文本→数值转换报错；`$ne`/`$nin` 的语义 = **非数值文本也匹配**（排除 NULL）
+  - `$prefix` 按**字面量**匹配（`%`/`_` 转义 + `ESCAPE '\'`），不是通配符
 - `$key`：对条目 `key` 施加与 `$meta` 相同的运算符（如按项目前缀 `/code/local/linux70/` 过滤）
 - `$fti`：全文（应用层分词，OR 语义）
 - `$search`：向量（外挂引擎提供 `vectors` 候选，按 `$search_score` 排序）
+- `$knn`：pgvector KNN；只能在最外层且只能出现一次（子查询/`$k-hop.where` 内报 `[JSE]`）；
+  距离恒为主序，`$knn_distance` 可投影
 - `$triple`：`subject` / `predicate` / `object` 边匹配；`direction`（`out` 沿指定 subject 的出边 / `in` 入边 / `both` 默认两端）
-- `$k-hop`：`from` / `predicates` / `depth` / `direction` / `where`，ID 拓扑遍历 + path 防环
+- `$k-hop`：`from` / `predicates` / `depth`（钳制 1..5）/ `direction` / `where`，ID 拓扑遍历 + path 防环
 - 排序键：`$search_score`（需 `$search`）、`$fti_rank`（需 `$fti`）、`$in_degree` / `$out_degree`（按边度数）
-- 聚合：`$count: true`（匹配总数）、`$group_by: "<path>"`（分组计数，按 count 降序）
-- 修饰符：`$project` / `$order` / `$limit` / `$offset`
+- 聚合：`$count: true`（匹配总数）、`$group_by: "<path>"`（分组计数，按 count 降序）；
+  **二者都忽略 `$order`**（聚合后行已重排）
+- 修饰符：`$project` / `$order` / `$limit`（≤1000）/ `$offset`（钳制 0..1000000）
 
-### 路径约定
+### 路径与类型约定
 
 - `$meta.path` 相对 `meta` 根节点（`lang` → `meta->>'lang'`）
 - `$project` / `$order` 路径从行根起算（`key`、`meta.symbol`、`content.code`）
+- `$project` 输出**原生 JSON 类型**：`meta.line` 是数字、`content.*` 是字符串/对象；
+  行根的 `id`/`version`/`node_count` 等也为数字（其余为向后兼容仍输出字符串）
 
 ---
 

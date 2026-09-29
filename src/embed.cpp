@@ -39,7 +39,7 @@ std::string vec_literal(const float* v, int dim) {
 
 }  // namespace
 
-long import_vectors(Db& db, const EmbedOptions& opt) {
+EmbedResult import_vectors(Db& db, const EmbedOptions& opt) {
     if (opt.bin_file.empty() || opt.meta_file.empty() || opt.project.empty() || opt.root.empty())
         throw std::runtime_error("[EMBED] bin-file/meta-file/project/root are required");
 
@@ -54,7 +54,7 @@ long import_vectors(Db& db, const EmbedOptions& opt) {
     if (!bin || dim == 0) throw std::runtime_error("[EMBED] bad bin header");
     if (dim != 768) throw std::runtime_error("[EMBED] expected 768 dims, got " + std::to_string(dim));
 
-    db.exec("BEGIN");
+    Db::Tx tx(db);
     db.exec("CREATE TEMP TABLE stg_vec(key text, vec text) ON COMMIT DROP");
 
     std::string buf;
@@ -105,14 +105,22 @@ long import_vectors(Db& db, const EmbedOptions& opt) {
     // HNSW is expensive to maintain per row; for large loads drop and rebuild it.
     bool bulk = rows > 20000;
     if (bulk) db.exec("DROP INDEX IF EXISTS idx_knowledge_emb");
-    db.exec(
-        "UPDATE knowledge k SET embedding = v.vec::vector "
-        "FROM (SELECT DISTINCT ON (key) key, vec FROM stg_vec) v WHERE k.key = v.key");
+    json_t* mrows = db.query_json(
+        "WITH upd AS ("
+        " UPDATE knowledge k SET embedding = v.vec::vector "
+        " FROM (SELECT DISTINCT ON (key) key, vec FROM stg_vec) v WHERE k.key = v.key "
+        " RETURNING k.id) SELECT count(*) AS matched FROM upd",
+        {});
+    long matched = kutil::json_as_int(json_object_get(json_array_get(mrows, 0), "matched"));
+    json_decref(mrows);
     if (bulk)
         db.exec("CREATE INDEX idx_knowledge_emb ON knowledge USING hnsw (embedding vector_cosine_ops)");
     db.exec("DROP TABLE stg_vec");
-    db.exec("COMMIT");
+    tx.commit();
     if (mismatch > 0)
         std::fprintf(stderr, "[EMBED] WARN: %ld records skipped (bin/meta name mismatch)\n", mismatch);
-    return rows;
+    EmbedResult res;
+    res.staged = rows;
+    res.matched = matched;
+    return res;
 }

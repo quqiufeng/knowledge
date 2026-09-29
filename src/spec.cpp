@@ -1,6 +1,7 @@
 #include "spec.hpp"
 
 #include "util.hpp"
+#include "write.hpp"
 
 #include <jansson.h>
 
@@ -46,12 +47,7 @@ void spec_set(Db& db, const std::string& category, const std::string& spec_json)
     }
     std::string key = "/spec/" + category;
     std::string meta = std::string(R"({"category":"spec","applies_to":")") + category + R"("})";
-    db.exec(
-        "INSERT INTO knowledge (key, meta, content, search_tsv) "
-        "VALUES ($1, $2::jsonb, $3::jsonb, to_tsvector('simple', $4)) "
-        "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
-        "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()",
-        {key, meta, kutil::dump_owned(spec), category});
+    kwrite::upsert_entry(db, key, meta, kutil::dump_owned(spec), category);
 }
 
 json_t* spec_load(Db& db, const std::string& category) {

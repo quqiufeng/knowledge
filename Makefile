@@ -23,9 +23,20 @@ src/%.o: src/%.cpp
 test: $(BIN)
 	./tests/smoke.sh
 
+# Unoptimized build with debug info (for gdb).
+debug:
+	$(MAKE) clean
+	$(MAKE) CXXFLAGS="-std=c++17 -O0 -g -Wall -Wextra -MMD -MP" all
+
+# ASan+UBSan build (memory/UB regression runs).
+asan:
+	$(MAKE) clean
+	$(MAKE) CXXFLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -MMD -MP" \
+	        LDLIBS="-ljansson -lpq -lpthread -fsanitize=address,undefined" all
+
 clean:
 	rm -f $(OBJ) $(OBJ:.o=.d) $(BIN)
 
 -include $(OBJ:.o=.d)
 
-.PHONY: all clean test
+.PHONY: all clean test debug asan

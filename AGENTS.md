@@ -103,15 +103,20 @@ AI 只产出**受限 JSON 表达式**，编译器翻译为参数化 SQL（安全
 
 ### 修饰符
 
-- `$project`（字段裁剪）、`$order`、`$limit`（≤1000）、`$offset`
+- `$project`（字段裁剪）、`$order`、`$limit`（≤1000）、`$offset`（≤1000000）
 - `$count: true`（匹配总数）、`$group_by: "<path>"`（分组计数，按 count 降序）
+- **`$count` / `$group_by` 忽略 `$order`**（聚合后行已重排）
 - `$order` 排序键：`$search_score`（需 `$search`）、`$fti_rank`（需 `$fti`）、`$in_degree` / `$out_degree`（边度数）
 - `$include_archived: true`：默认只查活跃数据（`is_active`）；归档需显式包含
 
-### 路径约定
+### 路径与类型约定
 
 - `$meta.path` 相对 `meta` 根（`lang` → `meta->>'lang'`）
 - `$project` / `$order` 从行根起算（`key`、`meta.symbol`、`content.code`、`content.text`）
+- `$project` 输出**原生 JSON 类型**（`meta.line` 是数字、`content.text` 是字符串）；
+  行根 `id`/`version` 也是数字
+- 数值比较带守卫：右值为数值时左值须是数字文本才比较（文本列不再报转换错）
+- `$prefix` 是**字面量**（`%`/`_` 已转义）；`$knn` 只能在最外层且只能一个，可投影 `$knn_distance`
 
 ---
 
@@ -143,7 +148,7 @@ AI 只产出**受限 JSON 表达式**，编译器翻译为参数化 SQL（安全
 ```bash
 # 某目录下被调用最多的函数
 echo '{"$where":{"$and":[{"$key":{"$prefix":"/code/local/linux/mm/"}},
-  {"$meta":{"path":"kind","$eq":"function"}}]," },"$project":["meta.symbol"],
+  {"$meta":{"path":"kind","$eq":"function"}}]},"$project":["meta.symbol"],
   "$order":{"$in_degree":"desc"},"$limit":10}' | ./knowledge query
 # 分组计数
 echo '{"$where":{"$key":{"$prefix":"/code/local/linux/"}},"$group_by":"meta.kind"}' | ./knowledge query
@@ -190,6 +195,8 @@ echo '{"$where":{"$and":[{"$key":{"$prefix":"/code/local/"}},
 
 - 所有写操作追加 `/audit/{agent}/...`，带 `meta.action`/`target` 并建 `about` 边。
 - `put`/`import-records --category` 按 `/spec/{category}` 校验；批量违反整批回滚。
+- **version 内容变化才 +1**（幂等重写 version 不动）；`link`/`remember --about` 端点不存在会报错回滚。
+- **写即复活**：`put`/导入到已归档条目会恢复其活跃状态（免先 `restore`）。
 
 ---
 
@@ -197,11 +204,12 @@ echo '{"$where":{"$and":[{"$key":{"$prefix":"/code/local/"}},
 
 ```bash
 ./knowledge serve --port 8931 --ro        # 只读角色，DB 层禁止写
-# GET  /health  /stats  /search?q=&k=  /context?key=&depth=
+# GET  /health  /stats  /search?q=&k=  /context?key=&depth=&exclude_headers=
 # POST /jse     (body 为 JSE；可带 "$vectors":[...] 供 $search)
 ```
 
-限额：请求体 ≤1MB、`statement_timeout=30s`、`$limit ≤1000`、`$k-hop depth ≤5`。
+限额：请求体 ≤1MB、`statement_timeout=30s`、`$limit ≤1000`、`$k-hop depth ≤5`；
+`search k` 钳制 1..1000、`context depth` 钳制 0..5；非法 JSE 返回 400 + `[JSE] ...`。
 
 ---
 
@@ -221,7 +229,8 @@ echo '{"$where":{"$and":[{"$key":{"$prefix":"/code/local/"}},
 ## 10. 快速自检
 
 ```bash
-make test          # 编译器/查询/记忆/API 冒烟（35 项）
+make test          # 编译器/查询/记忆/API 冒烟（63 项）
+make debug         # -O0 调试构建；make asan → ASan/UBSan 构建
 ./knowledge tokenize "__alloc_pages_slowpath"     # 应拆出 alloc/pages/slowpath
 ./knowledge version
 ```

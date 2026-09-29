@@ -11,6 +11,11 @@ struct EmbedOptions {
     long limit{0};
 };
 
+struct EmbedResult {
+    long staged{0};  // vectors read from bin/meta
+    long matched{0};  // rows whose embedding actually updated
+};
+
 // Load vectors from a my_db *.jina.bin into knowledge.embedding, aligned by
 // chunks_meta.jsonl order (record i <-> meta line i).
-long import_vectors(Db& db, const EmbedOptions& opt);
+EmbedResult import_vectors(Db& db, const EmbedOptions& opt);

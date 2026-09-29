@@ -66,6 +66,7 @@ CREATE INDEX idx_knowledge_kind   ON knowledge ((meta->>'kind'))   WHERE is_acti
 CREATE INDEX idx_knowledge_lang   ON knowledge ((meta->>'lang'))   WHERE is_active;
 CREATE INDEX idx_knowledge_symbol ON knowledge ((meta->>'symbol')) WHERE is_active;
 CREATE INDEX idx_knowledge_file   ON knowledge ((meta->>'file'))   WHERE is_active;
+CREATE INDEX idx_knowledge_project ON knowledge ((meta->>'project')) WHERE is_active;
 
 -- 全文检索（应用层预分词写入 search_tsv）
 CREATE INDEX idx_knowledge_fti

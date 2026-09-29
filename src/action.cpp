@@ -2,6 +2,7 @@
 
 #include "spec.hpp"
 #include "util.hpp"
+#include "write.hpp"
 
 #include <jansson.h>
 
@@ -12,66 +13,6 @@
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
-
-namespace {
-
-const char* P_ABOUT = "/pred/about";
-
-void ensure_predicate(Db& db, const std::string& key, const char* name) {
-    db.exec(
-        "INSERT INTO knowledge (key, meta, content, search_tsv) VALUES ($1, $2::jsonb, '{}'::jsonb, "
-        "to_tsvector('simple', $3)) ON CONFLICT (key) DO NOTHING",
-        {key, std::string(R"({"category":"predicate","name":")") + name + R"("})", name});
-}
-
-std::string now_iso() {
-    auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", std::localtime(&t));
-    return buf;
-}
-
-std::string audit_key(const std::string& agent) {
-    static std::atomic<unsigned> seq{0};
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::system_clock::now().time_since_epoch())
-                  .count();
-    return "/audit/" + agent + "/" + std::to_string(ms) + "-" + std::to_string(getpid()) + "-" +
-           std::to_string(seq++);
-}
-
-}  // namespace
-
-std::string audit(Db& db, const std::string& agent, const std::string& action,
-                  const std::string& target, const std::string& detail_json) {
-    std::string key = audit_key(agent.empty() ? "anon" : agent);
-    json_t* meta = json_object();
-    json_object_set_new(meta, "kind", json_string("audit"));
-    json_object_set_new(meta, "agent", json_string(agent.c_str()));
-    json_object_set_new(meta, "action", json_string(action.c_str()));
-    json_object_set_new(meta, "target", json_string(target.c_str()));
-    json_object_set_new(meta, "ts", json_string(now_iso().c_str()));
-    json_t* content = json_object();
-    json_t* detail = detail_json.empty() ? json_null() : json_loads(detail_json.c_str(), JSON_DECODE_ANY, nullptr);
-    json_object_set_new(content, "detail", detail ? detail : json_null());
-
-    db.exec(
-        "INSERT INTO knowledge (key, meta, content, search_tsv) "
-        "VALUES ($1, $2::jsonb, $3::jsonb, to_tsvector('simple', $4)) "
-        "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
-        "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()",
-        {key, kutil::dump_owned(meta), kutil::dump_owned(content), action + " " + target});
-
-    if (!target.empty()) {
-        ensure_predicate(db, P_ABOUT, "about");
-        db.exec(
-            "INSERT INTO statement (subject_id, predicate_id, object_id) "
-            "SELECT a.id, p.id, o.id FROM knowledge a, knowledge p, knowledge o "
-            "WHERE a.key = $1 AND p.key = $2 AND o.key = $3 ON CONFLICT DO NOTHING",
-            {key, P_ABOUT, target});
-    }
-    return key;
-}
 
 std::string action_put(Db& db, const std::string& agent, const std::string& key,
                        const std::string& meta_json, const std::string& content_json,
@@ -114,14 +55,11 @@ std::string action_put(Db& db, const std::string& agent, const std::string& key,
 
     std::string terms = text;
     if (terms.empty()) terms = kutil::dump_owned(json_deep_copy(content));
-    db.exec(
-        "INSERT INTO knowledge (key, meta, content, search_tsv) "
-        "VALUES ($1, $2::jsonb, $3::jsonb, to_tsvector('simple', $4)) "
-        "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
-        "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()",
-        {key, kutil::dump_owned(meta), kutil::dump_owned(content), terms});
 
-    audit(db, agent, "put", key, "");
+    Db::Tx tx(db);
+    kwrite::upsert_entry(db, key, kutil::dump_owned(meta), kutil::dump_owned(content), terms);
+    kwrite::audit(db, agent, "put", key, "");
+    tx.commit();
     return key;
 }
 
@@ -129,24 +67,28 @@ bool action_forget(Db& db, const std::string& agent, const std::string& key, boo
     if (key.empty()) throw std::runtime_error("[ACTION] forget requires a key");
     if (!force && key.rfind("/mem/", 0) != 0)
         throw std::runtime_error("[ACTION] forget only applies to /mem/ keys (use --force to override)");
+    Db::Tx tx(db);
     json_t* rows = db.query_json(
         "UPDATE knowledge SET is_archived = true, end_time = now(), version = version + 1, "
         "updated_at = now() WHERE key = $1 AND is_active RETURNING key",
         {key});
     bool changed = json_array_size(rows) > 0;
     json_decref(rows);
-    if (changed) audit(db, agent, "forget", key, "");
+    if (changed) kwrite::audit(db, agent, "forget", key, "");
+    tx.commit();
     return changed;
 }
 
 bool action_restore(Db& db, const std::string& agent, const std::string& key) {
     if (key.empty()) throw std::runtime_error("[ACTION] restore requires a key");
+    Db::Tx tx(db);
     json_t* rows = db.query_json(
         "UPDATE knowledge SET is_archived = false, end_time = NULL, version = version + 1, "
         "updated_at = now() WHERE key = $1 AND NOT is_active RETURNING key",
         {key});
     bool changed = json_array_size(rows) > 0;
     json_decref(rows);
-    if (changed) audit(db, agent, "restore", key, "");
+    if (changed) kwrite::audit(db, agent, "restore", key, "");
+    tx.commit();
     return changed;
 }

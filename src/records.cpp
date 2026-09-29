@@ -2,6 +2,7 @@
 
 #include "spec.hpp"
 #include "util.hpp"
+#include "write.hpp"
 
 #include <jansson.h>
 
@@ -73,11 +74,7 @@ class Stage {
     }
     void finish() {
         flush();
-        db_.exec(
-            "INSERT INTO knowledge (key, meta, content, search_tsv) "
-            "SELECT key, meta::jsonb, content::jsonb, to_tsvector('simple', terms) FROM stg_knowledge "
-            "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
-            "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()");
+        kwrite::upsert_from_stage(db_);
     }
     long count() const { return count_; }
 
@@ -92,11 +89,12 @@ class Stage {
     long count_{0};
 };
 
-void emit(Stage& stage, const RecordsOptions& opt, const std::string& source, const json_t* rec,
+bool emit(Stage& stage, const RecordsOptions& opt, const std::string& source, const json_t* rec,
           const json_t* spec) {
     std::string kv = key_of(rec, opt.key_field);
-    if (kv.empty()) return;
-    std::string key = opt.prefix + kv;
+    if (kv.empty()) return false;
+    // An absolute key (starts with '/') is used as-is; otherwise prefix it.
+    std::string key = (!opt.prefix.empty() && !kv.empty() && kv[0] == '/') ? kv : opt.prefix + kv;
 
     json_t* meta = json_object();
     json_object_set_new(meta, "kind", json_string(opt.kind.c_str()));
@@ -131,11 +129,12 @@ void emit(Stage& stage, const RecordsOptions& opt, const std::string& source, co
     }
 
     stage.add(key, kutil::dump_owned(meta), kutil::dump_owned(content), terms);
+    return true;
 }
 
 }  // namespace
 
-long import_records(Db& db, const RecordsOptions& opt) {
+RecordsResult import_records(Db& db, const RecordsOptions& opt) {
     if (opt.file.empty()) throw std::runtime_error("[RECORDS] file is required");
     std::string format = opt.format;
     if (format.empty()) {
@@ -152,9 +151,10 @@ long import_records(Db& db, const RecordsOptions& opt) {
     if (!in) throw std::runtime_error("[RECORDS] cannot open " + opt.file);
     std::string source = basename_of(opt.file);
 
-    db.exec("BEGIN");
+    Db::Tx tx(db);
     Stage stage(db);
     json_t* spec = spec_load(db, opt.category);
+    RecordsResult res;
 
     if (format == "jsonl") {
         std::string line;
@@ -163,9 +163,10 @@ long import_records(Db& db, const RecordsOptions& opt) {
             json_t* rec = json_loads(line.c_str(), 0, nullptr);
             if (!json_is_object(rec)) {
                 if (rec) json_decref(rec);
+                res.skipped++;
                 continue;
             }
-            emit(stage, opt, source, rec, spec);
+            if (!emit(stage, opt, source, rec, spec)) res.skipped++;
             json_decref(rec);
         }
     } else {
@@ -185,14 +186,15 @@ long import_records(Db& db, const RecordsOptions& opt) {
             for (size_t i = 0; i < cols.size() && i < vals.size(); ++i) {
                 json_object_set_new(rec, cols[i].c_str(), json_string(vals[i].c_str()));
             }
-            emit(stage, opt, source, rec, spec);
+            if (!emit(stage, opt, source, rec, spec)) res.skipped++;
             json_decref(rec);
         }
     }
 
     stage.finish();
     db.exec("DROP TABLE stg_knowledge");
-    db.exec("COMMIT");
+    tx.commit();
     if (spec) json_decref(spec);
-    return stage.count();
+    res.imported = stage.count();
+    return res;
 }

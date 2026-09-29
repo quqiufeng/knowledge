@@ -1,6 +1,7 @@
 #include "compile.hpp"
 
 #include "tokenize.hpp"
+#include "util.hpp"
 
 #include <jansson.h>
 
@@ -26,6 +27,9 @@ struct Ctx {
     std::string fti_tsq;
     std::string knn_order;
     long knn_k{0};
+    // True while compiling the WHERE of a $k-hop (a lateral/recursive subquery);
+    // constructs that must live in the outer query (like $knn ordering) are rejected there.
+    bool in_subquery{false};
     const std::function<bool(const std::string&, long long&)>* resolve_key{nullptr};
 };
 
@@ -48,6 +52,13 @@ std::string value_to_text(const json_t* v) {
     if (json_is_false(v)) return "false";
     if (json_is_null(v)) return "";
     throw std::runtime_error("[JSE] unsupported scalar value type");
+}
+
+// True when the stored text value parses as a number. Used to guard ::numeric
+// casts: comparing a text column (e.g. meta.symbol) against a JSON number must
+// filter, not raise "invalid input syntax for type numeric".
+std::string num_guard(const std::string& expr) {
+    return "(" + expr + " ~ '^-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$')";
 }
 
 bool is_path_char(char c) {
@@ -73,31 +84,23 @@ std::vector<std::string> validate_path(const std::string& path) {
     return parts;
 }
 
-std::string json_path_expr(const std::string& alias, const std::string& column, const std::string& path) {
+// Build a JSON path expression. as_json=true keeps the final segment as jsonb
+// (native types when projected); as_json=false extracts text (for comparisons).
+std::string json_path_expr(const std::string& alias, const std::string& column,
+                           const std::string& path, bool as_json = false) {
     std::vector<std::string> parts = validate_path(path);
     std::string expr = alias + "." + column;
     for (size_t i = 0; i < parts.size(); ++i) {
         bool last = (i + 1 == parts.size());
-        expr += last ? "->>'" : "->'";
+        if (last && as_json) {
+            expr += "->'";
+        } else {
+            expr += last ? "->>'" : "->'";
+        }
         expr += parts[i];
         expr += "'";
     }
     return expr;
-}
-
-std::string pg_text_array(const std::vector<std::string>& items) {
-    std::string out = "{";
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (i) out += ",";
-        out += '"';
-        for (char c : items[i]) {
-            if (c == '"' || c == '\\') out += '\\';
-            out += c;
-        }
-        out += '"';
-    }
-    out += "}";
-    return out;
 }
 
 std::string pg_numeric_array(const std::vector<std::string>& items) {
@@ -120,7 +123,8 @@ std::string compile_field(const std::string& expr, const json_t* meta, Ctx& ctx)
         if (json_is_null(v)) {
             clauses.push_back(expr + " IS NULL");
         } else if (is_number(v)) {
-            clauses.push_back("(" + expr + ")::numeric = " + bind_param(ctx, value_to_text(v)));
+            clauses.push_back("(" + num_guard(expr) + " AND (" + expr + ")::numeric = " +
+                              bind_param(ctx, value_to_text(v)) + ")");
         } else {
             clauses.push_back(expr + " = " + bind_param(ctx, value_to_text(v)));
         }
@@ -130,7 +134,9 @@ std::string compile_field(const std::string& expr, const json_t* meta, Ctx& ctx)
         if (json_is_null(v)) {
             clauses.push_back(expr + " IS NOT NULL");
         } else if (is_number(v)) {
-            clauses.push_back("(" + expr + ")::numeric <> " + bind_param(ctx, value_to_text(v)));
+            // Non-numeric text is simply "not equal"; NULL rows stay excluded.
+            clauses.push_back("(" + expr + " IS NOT NULL AND NOT (" + num_guard(expr) + " AND (" +
+                              expr + ")::numeric = " + bind_param(ctx, value_to_text(v)) + "))");
         } else {
             clauses.push_back(expr + " <> " + bind_param(ctx, value_to_text(v)));
         }
@@ -141,8 +147,12 @@ std::string compile_field(const std::string& expr, const json_t* meta, Ctx& ctx)
     for (int i = 0; i < 4; ++i) {
         v = json_object_get(meta, cmp_ops[i]);
         if (!v) continue;
-        std::string lhs = is_number(v) ? "(" + expr + ")::numeric" : expr;
-        clauses.push_back(lhs + " " + cmp_sql[i] + " " + bind_param(ctx, value_to_text(v)));
+        if (is_number(v)) {
+            clauses.push_back("(" + num_guard(expr) + " AND (" + expr + ")::numeric " + cmp_sql[i] +
+                              " " + bind_param(ctx, value_to_text(v)) + ")");
+        } else {
+            clauses.push_back(expr + " " + cmp_sql[i] + " " + bind_param(ctx, value_to_text(v)));
+        }
     }
 
     auto compile_set = [&](const char* key, bool negated) {
@@ -158,12 +168,21 @@ std::string compile_field(const std::string& expr, const json_t* meta, Ctx& ctx)
             if (!is_number(e)) numeric = false;
             items.push_back(value_to_text(e));
         }
-        std::string lit = numeric ? pg_numeric_array(items) : pg_text_array(items);
+        std::string lit = numeric ? pg_numeric_array(items) : kutil::pg_text_array(items);
         std::string cast = numeric ? "::numeric[]" : "::text[]";
-        std::string lhs = numeric ? "(" + expr + ")::numeric" : expr;
-        std::string clause = lhs + " = ANY(" + bind_param(ctx, lit) + cast + ")";
-        if (negated) clause = "NOT (" + clause + ")";
-        clauses.push_back(clause);
+        std::string any_clause;
+        if (numeric) {
+            any_clause = num_guard(expr) + " AND (" + expr + ")::numeric = ANY(" +
+                         bind_param(ctx, lit) + cast + ")";
+        } else {
+            any_clause = expr + " = ANY(" + bind_param(ctx, lit) + cast + ")";
+        }
+        if (negated) {
+            // NULL rows stay excluded; non-numeric text is simply not a member.
+            clauses.push_back("(" + expr + " IS NOT NULL AND NOT (" + any_clause + "))");
+        } else {
+            clauses.push_back("(" + any_clause + ")");
+        }
     };
     compile_set("$in", false);
     compile_set("$nin", true);
@@ -187,7 +206,9 @@ std::string compile_field(const std::string& expr, const json_t* meta, Ctx& ctx)
     v = json_object_get(meta, "$prefix");
     if (v) {
         if (!json_is_string(v)) throw std::runtime_error("[JSE] $prefix requires a string");
-        clauses.push_back(expr + " LIKE " + bind_param(ctx, std::string(json_string_value(v)) + "%"));
+        // Escape LIKE wildcards so a literal '_'/'%' in the prefix stays literal.
+        clauses.push_back(expr + " LIKE " + bind_param(ctx, kutil::escape_like(json_string_value(v)) + "%") +
+                          " ESCAPE E'\\\\'");
     }
 
     if (clauses.empty()) throw std::runtime_error("[JSE] $meta requires at least one operator");
@@ -278,11 +299,19 @@ std::string compile_khop(const json_t* hop, Ctx& ctx, const std::string& alias) 
     if (preds.empty()) throw std::runtime_error("[JSE] $k-hop requires non-empty predicates");
 
     std::string from_param = bind_param(ctx, json_string_value(from_v));
-    std::string pred_param = bind_param(ctx, pg_text_array(preds));
+    std::string pred_param = bind_param(ctx, kutil::pg_text_array(preds));
 
     std::vector<std::string> inner = {"c.depth > 0", "k.is_active"};
     const json_t* where = json_object_get(hop, "where");
-    if (where) inner.push_back(compile_node(where, ctx, "k"));
+    if (where) {
+        // The WHERE is compiled into a recursive subquery: constructs whose SQL
+        // must reference the outer query (like $knn ORDER BY) are rejected there.
+        bool prev = ctx.in_subquery;
+        ctx.in_subquery = true;
+        std::string inner_sql = compile_node(where, ctx, "k");
+        ctx.in_subquery = prev;
+        inner.push_back(inner_sql);
+    }
 
     std::string inner_where;
     for (size_t i = 0; i < inner.size(); ++i) {
@@ -356,6 +385,11 @@ std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias)
     }
     if (const json_t* v = json_object_get(node, "$knn")) {
         require_object(v, "$knn");
+        if (ctx.in_subquery)
+            throw std::runtime_error(
+                "[JSE] $knn cannot be used inside $k-hop.where (it must order the outer query)");
+        if (!ctx.knn_order.empty())
+            throw std::runtime_error("[JSE] only one $knn node is allowed per query");
         const json_t* vec = json_object_get(v, "vector");
         if (!json_is_array(vec) || json_array_size(vec) == 0)
             throw std::runtime_error("[JSE] $knn requires non-empty 'vector' array");
@@ -406,8 +440,8 @@ bool ast_has_search(const json_t* node) {
 }
 
 std::string project_expr(const std::string& alias, const std::string& path) {
-    if (path.rfind("meta.", 0) == 0) return json_path_expr(alias, "meta", path.substr(5));
-    if (path.rfind("content.", 0) == 0) return json_path_expr(alias, "content", path.substr(8));
+    if (path.rfind("meta.", 0) == 0) return json_path_expr(alias, "meta", path.substr(5), true);
+    if (path.rfind("content.", 0) == 0) return json_path_expr(alias, "content", path.substr(8), true);
     if (base_columns().count(path)) return alias + "." + path;
     throw std::runtime_error("[JSE_SECURITY] invalid projection path: " + path);
 }
@@ -484,14 +518,24 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
     }
 
     std::string projection;
+    bool first_proj = true;
     const json_t* proj = json_object_get(query, "$project");
     if (json_is_array(proj) && json_array_size(proj) > 0) {
         for (size_t i = 0; i < json_array_size(proj); ++i) {
             const json_t* p = json_array_get(proj, i);
             if (!json_is_string(p)) throw std::runtime_error("[JSE] $project entries must be strings");
             std::string path = json_string_value(p);
-            if (i) projection += ", ";
+            if (path == "$knn_distance") {
+                if (ctx.knn_order.empty())
+                    throw std::runtime_error("[JSE] $project $knn_distance requires a $knn node");
+                if (!first_proj) projection += ", ";
+                projection += ctx.knn_order + " AS \"$knn_distance\"";
+                first_proj = false;
+                continue;
+            }
+            if (!first_proj) projection += ", ";
             projection += project_expr(alias, path) + " AS \"" + path + "\"";
+            first_proj = false;
         }
     } else {
         projection = alias + ".id, " + alias + ".key, " + alias + ".meta";
@@ -535,8 +579,11 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
     }
     std::string offset_sql;
     const json_t* offset_v = json_object_get(query, "$offset");
-    if (json_is_integer(offset_v) && json_integer_value(offset_v) > 0) {
-        offset_sql = " OFFSET " + std::to_string(json_integer_value(offset_v));
+    if (json_is_integer(offset_v)) {
+        json_int_t off = json_integer_value(offset_v);
+        if (off < 0) off = 0;
+        if (off > 1000000) off = 1000000;  // clamp: deep pagination is not a goal
+        if (off > 0) offset_sql = " OFFSET " + std::to_string(off);
     }
 
     CompiledQuery out;

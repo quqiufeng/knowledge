@@ -16,6 +16,3 @@ std::string memory_fact(Db& db, const std::string& agent, const std::string& top
 // Action: controlled link between two existing keys.
 long memory_link(Db& db, const std::string& agent, const std::string& subject,
                  const std::string& predicate, const std::string& object);
-
-// Action: forget = archive (never physical delete). Only /mem/ keys unless force.
-bool memory_forget(Db& db, const std::string& key, bool force);

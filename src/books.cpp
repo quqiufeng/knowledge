@@ -1,6 +1,7 @@
 #include "books.hpp"
 
 #include "util.hpp"
+#include "write.hpp"
 
 #include <jansson.h>
 
@@ -72,16 +73,13 @@ class Stage {
     void finish() {
         flush_k();
         flush_e();
-        db_.exec(
-            "INSERT INTO knowledge (key, meta, content, search_tsv) "
-            "SELECT key, meta::jsonb, content::jsonb, to_tsvector('simple', terms) FROM stg_knowledge "
-            "ON CONFLICT (key) DO UPDATE SET meta = EXCLUDED.meta, content = EXCLUDED.content, "
-            "search_tsv = EXCLUDED.search_tsv, version = knowledge.version + 1, updated_at = now()");
+        kwrite::upsert_from_stage(db_);
         db_.exec(
             "INSERT INTO statement (subject_id, predicate_id, object_id) "
             "SELECT s.id, p.id, o.id FROM stg_statement t "
             "JOIN knowledge s ON s.key = t.subject JOIN knowledge p ON p.key = t.predicate "
-            "JOIN knowledge o ON o.key = t.object ON CONFLICT DO NOTHING");
+            "JOIN knowledge o ON o.key = t.object "
+            "ON CONFLICT ON CONSTRAINT uq_stmt DO UPDATE SET is_archived = false, end_time = NULL");
     }
     long edges() const { return edges_; }
 
@@ -108,14 +106,12 @@ void import_books(Db& db, const BooksOptions& opt) {
         throw std::runtime_error("[BOOKS] books dir not found: " + opt.books_dir);
     }
 
-    db.exec("BEGIN");
-    db.exec(
-        "INSERT INTO knowledge (key, meta, content, search_tsv) VALUES ($1, $2::jsonb, '{}'::jsonb, "
-        "to_tsvector('simple', 'contains')) ON CONFLICT (key) DO NOTHING",
-        {P_CONTAINS, R"({"category":"predicate","name":"contains"})"});
+    Db::Tx tx(db);
+    kwrite::ensure_predicate(db, P_CONTAINS);
 
     Stage stage(db);
     long pages = 0, books = 0;
+    bool limit_hit = false;
 
     std::vector<std::string> names;
     for (const auto& e : fs::directory_iterator(opt.books_dir)) {
@@ -127,6 +123,7 @@ void import_books(Db& db, const BooksOptions& opt) {
     std::sort(names.begin(), names.end());
 
     for (const auto& book : names) {
+        if (limit_hit) break;
         fs::path bdir = fs::path(opt.books_dir) / book;
         if (!fs::is_directory(bdir / "chapters")) continue;
 
@@ -159,6 +156,7 @@ void import_books(Db& db, const BooksOptions& opt) {
         std::sort(chapters.begin(), chapters.end());
 
         for (const auto& cpath : chapters) {
+            if (limit_hit) break;
             std::string chapter = cpath.filename().string();
             std::string chapter_key = book_key + "/chapters/" + chapter;
             json_t* cmeta = json_object();
@@ -176,7 +174,10 @@ void import_books(Db& db, const BooksOptions& opt) {
             std::sort(files.begin(), files.end());
 
             for (const auto& fpath : files) {
-                if (opt.limit > 0 && pages >= opt.limit) break;
+                if (opt.limit > 0 && pages >= opt.limit) {
+                    limit_hit = true;
+                    break;
+                }
                 std::string page = fpath.stem().string();
                 std::string rel = "chapters/" + chapter + "/" + fpath.filename().string();
                 std::string page_key = book_key + "/chapters/" + chapter + "/" + page;
@@ -203,6 +204,6 @@ void import_books(Db& db, const BooksOptions& opt) {
     stage.finish();
     db.exec("DROP TABLE stg_knowledge");
     db.exec("DROP TABLE stg_statement");
-    db.exec("COMMIT");
+    tx.commit();
     std::cerr << "[BOOKS] books: " << books << ", pages: " << pages << ", edges: " << stage.edges() << "\n";
 }
