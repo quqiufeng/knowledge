@@ -260,6 +260,13 @@ C++ 侧 `src/vector.cpp` 用 `popen` 调用并解析，结果喂给 `compile_que
 结果附带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`，便于判断命中来源与调试。
 RRF 让"向量召回但全文未命中"与"全文精确但向量偏离"两类结果互补，优于单一排序。
 
+### 5.4.1 查询算子扩充
+
+- `$meta` 增加 `$like` / `$ilike` / `$prefix`：路径/符号的前缀与模糊匹配（值仍走参数绑定）。
+- `$count: true`：返回匹配总数（聚合）。
+- 已知 key 在编译期解析为整数 id（`resolve_key`），省去每个条件的子查询。
+- 缺口：尚无 `$group by` 与「按度数排序」——目前"调用者最多的函数"只能写裸 SQL。
+
 ### 5.5 HTTP API（只读）
 
 查询层无状态（`compile_query` 是纯函数），状态全在 PG，因此天然支持多调用方共享同一知识库。
@@ -360,6 +367,8 @@ design.md             # 本文档
       - DB 载入：`array_to_tsvector`（免二次解析）替代 `to_tsvector`
       - 大项目（>20 万行）自动「丢索引/FK → 批量重建」，小项目保持增量（避免固定重建开销）
       - 结果：290s → 200s（chunks 67s / knowledge insert 67s / statement 15s / 索引重建 39s）
+- [x] **查询算子扩充**：`$meta` 的 `$like/$ilike/$prefix`；`$count` 聚合；Linux 数据对齐（用当前 `call_graph` 重建 linux70 图，563410 边，图与向量同源）
+- [x] **search 加权 RRF**：向量 1.0 / 全文 0.5（修复纯语义查询被全文噪声并列）
 - [x] **HTTP API（只读）**：`knowledge serve`（cpp-httplib + 连接池），端点 `/health` `/stats` `/jse` `/search` `/context`；服务端用 `knowledge_ro` 只读角色，写路径仅本地；请求体/超时/深度限额；`tests/smoke.sh` 覆盖
 
 ### 进行中 🚧

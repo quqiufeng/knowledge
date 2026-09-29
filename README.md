@@ -381,12 +381,13 @@ curl -s -G 'localhost:8931/context' --data-urlencode 'key=/code/local/redis/src/
 ## JSE 算子（当前实现）
 
 - `$and` / `$or` / `$not`
-- `$meta`：`path` + `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists`
+- `$meta`：`path` + `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$like/$ilike/$prefix`
 - `$fti`：全文（应用层分词，OR 语义）
 - `$search`：向量（外挂引擎提供 `vectors` 候选，按 `$search_score` 排序）
 - `$triple`：`subject` / `predicate` / `object` 边匹配；`direction`（`out` 沿指定 subject 的出边 / `in` 入边 / `both` 默认两端）
 - `$k-hop`：`from` / `predicates` / `depth` / `direction` / `where`，ID 拓扑遍历 + path 防环
 - 排序键：`$search_score`（需 `$search`）、`$fti_rank`（需 `$fti`，用 `ts_rank`）
+- 聚合：`$count: true`（返回匹配总数）
 - 修饰符：`$project` / `$order` / `$limit` / `$offset`
 
 ### 路径约定

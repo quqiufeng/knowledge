@@ -53,6 +53,11 @@ fi
 compiled=$(echo '{"$where":{"$triple":{"subject":"/code/local/linux/mm/page_alloc.c/__alloc_pages_slowpath","predicate":"/pred/calls","direction":"out"}},"$project":["key"]}' | $BIN compile)
 has '"params": \[\]' "$compiled" "key resolver emits integer literals (no params)"
 
+compiled=$(echo '{"$where":{"$meta":{"path":"file","$prefix":"mm/"}},"$project":["key"]}' | $BIN compile)
+has 'LIKE' "$compiled" "\$prefix compiles to LIKE"
+compiled=$(echo '{"$where":{"$meta":{"path":"symbol","$ilike":"%alloc%"}},"$count":true}' | $BIN compile)
+has 'count(\*)' "$compiled" "\$count compiles to count(*)"
+
 hybrid=$($BIN search "alloc pages" --k 3 --vector-cmd ./tools/vector_provider_stub.sh 2>&1)
 has '"rrf"' "$hybrid" "hybrid search emits rrf score"
 

@@ -175,6 +175,22 @@ std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias)
         clauses.push_back(expr + (json_is_true(v) ? " IS NOT NULL" : " IS NULL"));
     }
 
+    v = json_object_get(meta, "$like");
+    if (v) {
+        if (!json_is_string(v)) throw std::runtime_error("[JSE] $like requires a string");
+        clauses.push_back(expr + " LIKE " + bind_param(ctx, json_string_value(v)));
+    }
+    v = json_object_get(meta, "$ilike");
+    if (v) {
+        if (!json_is_string(v)) throw std::runtime_error("[JSE] $ilike requires a string");
+        clauses.push_back(expr + " ILIKE " + bind_param(ctx, json_string_value(v)));
+    }
+    v = json_object_get(meta, "$prefix");
+    if (v) {
+        if (!json_is_string(v)) throw std::runtime_error("[JSE] $prefix requires a string");
+        clauses.push_back(expr + " LIKE " + bind_param(ctx, std::string(json_string_value(v)) + "%"));
+    }
+
     if (clauses.empty()) throw std::runtime_error("[JSE] $meta requires at least one operator");
     std::string out = "(";
     for (size_t i = 0; i < clauses.size(); ++i) {
@@ -403,6 +419,13 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
     }
 
     std::string where_sql = compile_node(where, ctx, alias);
+
+    if (json_is_true(json_object_get(query, "$count"))) {
+        CompiledQuery out;
+        out.sql = cte + "SELECT count(*) AS count FROM knowledge " + alias + " WHERE " + where_sql;
+        out.params = ctx.params;
+        return out;
+    }
 
     std::string projection;
     const json_t* proj = json_object_get(query, "$project");
