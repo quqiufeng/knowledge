@@ -123,6 +123,7 @@ JSE 算子是 AI 与存储层之间的**契约**：存储引擎（PostgreSQL / �
 | 编译期 key→id 解析、`$k-hop` 结果上限、回归测试 | ✅ 完成 |
 | 导入优化（流式 + 内存受限 + 大项目批量重建索引） | ✅ 完成 |
 | HTTP API（只读，连接池，共享知识库） | ✅ 完成 |
+| Agent 记忆（受控写 Action：remember/fact/link/forget） | ✅ 完成 |
 | 多项目批量导入（16 仓库 / ~250 万 chunk） | 🚧 进行中 |
 | smoke test / 迁移对账 / 规范校验 / Action 层 | ⏳ 待办 |
 
@@ -387,6 +388,37 @@ curl -s -G 'localhost:8931/context' --data-urlencode 'key=/code/local/redis/src/
 
 限制：请求体 ≤ 1MB、每请求 `statement_timeout=30s`、`$limit` ≤ 1000、`$k-hop` depth ≤ 5；
 只读角色在数据库层禁止任何写操作。
+
+---
+
+## Agent 记忆（受控写 Action，本地）
+
+Agent 可以把本库当**长期记忆/大脑**：自主写入与检索。写入口是**受控 Action（本地 CLI）**，不是裸写。
+
+```bash
+# 情景事件：追加一条观察，并关联相关实体
+./knowledge remember --agent dsh --session s1 \
+  --text "page 分配慢路径在 mm/page_alloc.c" \
+  --about /code/local/redis/src/module.c/RM_PoolAlloc --tag memory,page
+
+# 键值事实：写新值时旧值自动归档（历史是一等数据）
+./knowledge fact --agent dsh --topic preferred_db --value '"postgresql"'
+
+# 关系
+./knowledge link /mem/dsh/events/xxx /pred/about /code/local/.../alloc_pages
+
+# 遗忘 = 归档（不物理删除）；默认只对 /mem/ 生效
+./knowledge forget /mem/dsh/events/xxx
+```
+
+设计要点：
+
+- **两种记忆**：情景事件追加（`/mem/{agent}/events/...`）+ 键值事实固化（`/mem/{agent}/facts/{topic}`）。
+- **命名空间隔离**：Agent 记忆在 `/mem/{agent}/...`，与代码知识 `/code/...` 分开。
+- **Provenance**：每条自动带 `meta.agent` / `session` / `ts`。
+- **不删只归档**：覆盖旧值时写 `/@archive/{version}` 并建 `/pred/supersedes` 边，可回溯。
+- **默认只读活跃数据**：查询默认注入 `is_active`（需要历史时用 `$include_archived: true`）。
+- **写只在本地**：远程 HTTP API 仍只读；写用本地 CLI（写角色）。
 
 ---
 

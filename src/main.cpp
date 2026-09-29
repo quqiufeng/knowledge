@@ -3,6 +3,7 @@
 #include "compile.hpp"
 #include "db.hpp"
 #include "importer.hpp"
+#include "memory.hpp"
 #include "server.hpp"
 #include "tokenize.hpp"
 
@@ -139,6 +140,17 @@ std::string env_or(const char* name, const std::string& fallback) {
     return (v && *v) ? std::string(v) : fallback;
 }
 
+void split_csv(const std::string& s, std::vector<std::string>& out) {
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t comma = s.find(',', start);
+        std::string item = s.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (!item.empty()) out.push_back(item);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+}
+
 int usage() {
     std::cerr << "usage: knowledge <command> [options]\n"
                  "  tokenize <text>\n"
@@ -151,6 +163,13 @@ int usage() {
                  "           [--limit N] [--skip-callgraph] [--skip-dataflow]\n"
                  "  import-books [--books-dir <dir>] [--book <name>] [--limit N]\n"
                  "  serve    [--port N] [--bind <addr>] [--pool N] [--ro] [--vector-cmd <cmd>]\n"
+                 "\n"
+                 "agent memory (local actions; write role):\n"
+                 "  remember --agent <id> --text <t> [--session s] [--about k1,k2] [--tag a,b]\n"
+                 "  fact     --agent <id> --topic <t> --value <json> [--session s]\n"
+                 "  link     <subject> <predicate> <object>\n"
+                 "  forget   <key> [--force]\n"
+                 "\n"
                  "  seed\n"
                  "  version\n"
                  "\n"
@@ -186,7 +205,7 @@ int main(int argc, char** argv) {
             if (a.rfind("--", 0) == 0) {
                 std::string name = a.substr(2);
                 if (name == "skip-callgraph" || name == "skip-dataflow" || name == "no-code" ||
-                    name == "no-content" || name == "ro") {
+                    name == "no-content" || name == "ro" || name == "force") {
                     opts[name] = "true";
                 } else if (i + 1 < argc) {
                     opts[name] = argv[++i];
@@ -268,6 +287,40 @@ int main(int argc, char** argv) {
                               : default_conninfo();
             so.vector_cmd = vector_cmd;
             return run_server(so);
+        }
+        if (cmd == "remember") {
+            std::vector<std::string> about, tags;
+            if (opts.count("about")) split_csv(opts["about"], about);
+            if (opts.count("tag")) split_csv(opts["tag"], tags);
+            Db db(default_conninfo());
+            std::string key = memory_remember(db, opts.count("agent") ? opts["agent"] : "",
+                                              opts.count("session") ? opts["session"] : "",
+                                              opts.count("text") ? opts["text"] : "", about, tags);
+            std::cout << "{\"key\":\"" << key << "\"}\n";
+            return 0;
+        }
+        if (cmd == "fact") {
+            Db db(default_conninfo());
+            std::string key = memory_fact(db, opts.count("agent") ? opts["agent"] : "",
+                                          opts.count("topic") ? opts["topic"] : "",
+                                          opts.count("value") ? opts["value"] : "null",
+                                          opts.count("session") ? opts["session"] : "");
+            std::cout << "{\"key\":\"" << key << "\"}\n";
+            return 0;
+        }
+        if (cmd == "link") {
+            if (pos.size() < 3) return usage();
+            Db db(default_conninfo());
+            long c = memory_link(db, pos[0], pos[1], pos[2]);
+            std::cout << "{\"matches\":" << c << "}\n";
+            return 0;
+        }
+        if (cmd == "forget") {
+            if (pos.empty()) return usage();
+            Db db(default_conninfo());
+            bool changed = memory_forget(db, pos[0], opts.count("force") > 0);
+            std::cout << "{\"forgotten\":" << (changed ? "true" : "false") << "}\n";
+            return 0;
         }
         if (cmd == "seed") {
             Db db(default_conninfo());

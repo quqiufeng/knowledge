@@ -289,6 +289,22 @@ RRF 让"向量召回但全文未命中"与"全文精确但向量偏离"两类结
 
 ---
 
+### 5.6 Agent 记忆（受控写 Action，本地）
+
+Agent 把本库当长期记忆。写入是**受控 Action**（本地 CLI），非裸写，全部 `src/memory.cpp`：
+
+| Action | 语义 |
+|---|---|
+| `remember` | 追加情景事件 `/mem/{agent}/events/{ts}-{n}`，`--about` 建 `/pred/about` 边 |
+| `fact` | 键值事实 `/mem/{agent}/facts/{topic}`；覆盖前把旧值写 `/@archive/{version}` 并建 `/pred/supersedes` |
+| `link` | 在两个已存在条目间建关系 |
+| `forget` | 归档（`is_archived=true, end_time=now()`），不物理删除；默认限 `/mem/` |
+
+- **命名空间**：`/mem/{agent}/...` 与 `/code/...` 隔离。
+- **Provenance**：自动注入 `meta.agent/session/ts`。
+- **历史是一等数据**：覆盖即归档，可回溯。
+- **口径注入**：查询默认 `AND is_active`（`$include_archived:true` 关闭）。
+
 ## 6. 安全模型
 
 | 风险 | 对策 |
@@ -374,6 +390,9 @@ design.md             # 本文档
 - [x] **文档重新定位**：从"code search 系统"改为"可查询知识底座（code search 为首个应用）"
 - [x] **search 加权 RRF**：向量 1.0 / 全文 0.5（修复纯语义查询被全文噪声并列）
 - [x] **HTTP API（只读）**：`knowledge serve`（cpp-httplib + 连接池），端点 `/health` `/stats` `/jse` `/search` `/context`；服务端用 `knowledge_ro` 只读角色，写路径仅本地；请求体/超时/深度限额；`tests/smoke.sh` 覆盖
+
+- [x] **Agent 记忆（Action 层，本地）**：`remember`/`fact`/`link`/`forget`；情景事件 + 键值事实；覆盖即归档（`/@archive` + `/pred/supersedes`）；`/mem/{agent}` 命名空间；provenance 自动注入
+- [x] **口径注入修复**：查询默认 `AND is_active`（此前只是文档承诺未实现），`$include_archived` 可关闭
 
 ### 进行中 🚧
 

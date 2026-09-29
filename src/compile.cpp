@@ -14,7 +14,7 @@ namespace {
 
 const std::unordered_set<std::string>& base_columns() {
     static const std::unordered_set<std::string> s = {
-        "id", "key", "version", "updated_at", "start_time",
+        "id", "key", "meta", "content", "version", "updated_at", "start_time",
         "end_time", "is_active", "is_archived",
     };
     return s;
@@ -429,6 +429,11 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
     }
 
     std::string where_sql = compile_node(where, ctx, alias);
+    // Default scope: active rows only (archived/expired excluded unless opted in).
+    std::string scope = where_sql;
+    if (!json_is_true(json_object_get(query, "$include_archived"))) {
+        scope = "(" + where_sql + ") AND " + alias + ".is_active";
+    }
 
     json_int_t out_limit = 100;
     if (json_is_integer(json_object_get(query, "$limit"))) {
@@ -442,14 +447,14 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
         std::string gexpr = project_expr(alias, json_string_value(group_v));
         CompiledQuery out;
         out.sql = cte + "SELECT " + gexpr + " AS \"group\", count(*) AS count FROM knowledge " + alias +
-                  " WHERE " + where_sql + " GROUP BY 1 ORDER BY count DESC LIMIT " + std::to_string(out_limit);
+                  " WHERE " + scope + " GROUP BY 1 ORDER BY count DESC LIMIT " + std::to_string(out_limit);
         out.params = ctx.params;
         return out;
     }
 
     if (json_is_true(json_object_get(query, "$count"))) {
         CompiledQuery out;
-        out.sql = cte + "SELECT count(*) AS count FROM knowledge " + alias + " WHERE " + where_sql;
+        out.sql = cte + "SELECT count(*) AS count FROM knowledge " + alias + " WHERE " + scope;
         out.params = ctx.params;
         return out;
     }
@@ -500,7 +505,7 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
     }
 
     CompiledQuery out;
-    out.sql = cte + "SELECT " + projection + " FROM knowledge " + alias + " WHERE " + where_sql +
+    out.sql = cte + "SELECT " + projection + " FROM knowledge " + alias + " WHERE " + scope +
               order_sql + " LIMIT " + std::to_string(limit) + offset_sql;
     out.params = ctx.params;
     return out;

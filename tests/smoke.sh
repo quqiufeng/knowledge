@@ -80,6 +80,18 @@ out=$($BIN search "memory" --k 5 --vector-cmd "$noisy" 2>&1)
 has 'alloc_pages' "$out" "search tolerates noisy provider output"
 rm -f "$noisy"
 
+echo "[smoke] agent memory"
+mkey=$($BIN remember --agent smoke --text "smoke memory event" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('key',''))" 2>/dev/null)
+case "$mkey" in /mem/smoke/events/*) ok "remember creates event" ;; *) bad "remember creates event" ;; esac
+TOPIC="t$$"
+$BIN fact --agent smoke --topic "$TOPIC" --value '"v1"' >/dev/null 2>&1
+$BIN fact --agent smoke --topic "$TOPIC" --value '"v2"' >/dev/null 2>&1
+arc=$(echo "{\"\$where\":{\"\$key\":{\"\$prefix\":\"/mem/smoke/facts/$TOPIC/@archive/\"}},\"\$count\":true}" | $BIN query | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['count'])" 2>/dev/null)
+[ "$arc" = "1" ] && ok "fact archives previous value" || bad "fact archives previous value (got '$arc')"
+$BIN forget "$mkey" >/dev/null 2>&1
+after=$(echo '{"$where":{"$key":{"$prefix":"/mem/smoke/events/"}},"$count":true}' | $BIN query | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['count'])" 2>/dev/null)
+[ "$after" = "0" ] && ok "forget archives; default scope excludes it" || bad "forget scope (got '$after')"
+
 echo "[smoke] http api"
 if command -v curl >/dev/null 2>&1; then
     $BIN serve --port 8799 --ro --pool 2 >/tmp/ksrv.log 2>&1 &
