@@ -322,11 +322,11 @@ design.md             # 本文档
 - [x] **编译期 key→id 解析**：`CompileOptions::resolve_key`，已知 key 直接产出整数 id 字面量（省去每个条件的子查询），未命中回退子查询
 - [x] **`$k-hop` 结果上限**：递归子查询尾部 `LIMIT 20000`，防扇出爆炸
 - [x] **混合检索（RRF）**：`search` = 向量候选 + 全文候选（`$fti` + `$fti_rank`），RRF 融合后过标量过滤；结果带 `rrf/vector_rank/lexical_rank/vector_score`
+- [x] **导入流式化**：`JsonObjectStream` 逐条解析顶层对象，`call_graph.json`/`dataflow.json` 不再整文件载入内存；python 全量（11M call_graph / 18M dataflow）→ 55402 条目 / 132441 边 / 12.9s，结果与旧实现一致
 
 ### 进行中 🚧
 
 - [ ] **多项目批量导入**：16 个仓库（约 250 万 chunk），分项目串行导入 + 校验
-- [ ] **大规模导入内存**：call_graph.json / dataflow.json 目前整体 `json_loads`，超大项目（Linux）需改流式解析
 
 ### 待办 ⏳
 

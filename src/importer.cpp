@@ -5,6 +5,7 @@
 
 #include <jansson.h>
 
+#include <cctype>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -76,15 +77,145 @@ void ensure_predicates(Db& db) {
     }
 }
 
-std::string read_file(const std::string& path, bool& ok) {
-    std::ifstream in(path);
-    if (!in) {
-        ok = false;
-        return "";
+// Streams a top-level JSON object ("key": value, ...) entry by entry, so large
+// call_graph.json / dataflow.json never need to be loaded whole into memory.
+class JsonObjectStream {
+  public:
+    explicit JsonObjectStream(const std::string& path) { f_ = std::fopen(path.c_str(), "rb"); }
+    ~JsonObjectStream() {
+        if (f_) std::fclose(f_);
     }
-    ok = true;
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
+    bool ok() const { return f_ != nullptr; }
+
+    bool next(std::string& key, std::string& value) {
+        if (!started_) {
+            int c;
+            do {
+                c = get();
+            } while (c >= 0 && std::isspace(c));
+            if (c != '{') return false;
+            started_ = true;
+        }
+        int c;
+        do {
+            c = get();
+        } while (c == ',' || std::isspace(c));
+        if (c < 0 || c == '}') return false;
+        unget();
+
+        std::string raw;
+        if (!read_string_raw(raw)) return false;
+        json_t* kj = json_loads(raw.c_str(), JSON_DECODE_ANY, nullptr);
+        if (!json_is_string(kj)) {
+            if (kj) json_decref(kj);
+            return false;
+        }
+        key = json_string_value(kj);
+        json_decref(kj);
+
+        do {
+            c = get();
+        } while (std::isspace(c));
+        if (c != ':') return false;
+        return read_value_raw(value);
+    }
+
+  private:
+    bool fill() {
+        if (pos_ < buf_.size()) return true;
+        buf_.resize(1 << 20);
+        size_t n = std::fread(&buf_[0], 1, buf_.size(), f_);
+        buf_.resize(n);
+        pos_ = 0;
+        return n > 0;
+    }
+    int get() { return fill() ? static_cast<unsigned char>(buf_[pos_++]) : -1; }
+    void unget() {
+        if (pos_ > 0) --pos_;
+    }
+
+    bool read_string_raw(std::string& out) {
+        int c = get();
+        if (c != '"') {
+            unget();
+            return false;
+        }
+        out.clear();
+        out.push_back('"');
+        while (true) {
+            int d = get();
+            if (d < 0) return false;
+            out.push_back(static_cast<char>(d));
+            if (d == '\\') {
+                int e = get();
+                if (e < 0) return false;
+                out.push_back(static_cast<char>(e));
+            } else if (d == '"') {
+                return true;
+            }
+        }
+    }
+
+    bool read_value_raw(std::string& out) {
+        int c;
+        do {
+            c = get();
+        } while (c == ' ' || c == '\n' || c == '\r' || c == '\t');
+        if (c < 0) return false;
+        out.clear();
+        out.push_back(static_cast<char>(c));
+        if (c == '{' || c == '[') {
+            char open = static_cast<char>(c);
+            char close = (c == '{') ? '}' : ']';
+            int depth = 1;
+            bool in_str = false, esc = false;
+            while (depth > 0) {
+                int d = get();
+                if (d < 0) return false;
+                out.push_back(static_cast<char>(d));
+                if (in_str) {
+                    if (esc) esc = false;
+                    else if (d == '\\') esc = true;
+                    else if (d == '"') in_str = false;
+                } else {
+                    if (d == '"') in_str = true;
+                    else if (d == open) depth++;
+                    else if (d == close) depth--;
+                }
+            }
+            return true;
+        }
+        if (c == '"') {
+            bool esc = false;
+            while (true) {
+                int d = get();
+                if (d < 0) return false;
+                out.push_back(static_cast<char>(d));
+                if (esc) esc = false;
+                else if (d == '\\') esc = true;
+                else if (d == '"') return true;
+            }
+        }
+        while (true) {
+            int d = get();
+            if (d < 0 || d == ',' || d == '}') {
+                if (d >= 0) unget();
+                break;
+            }
+            if (d == ' ' || d == '\n' || d == '\r' || d == '\t') {
+                unget();
+                break;
+            }
+            out.push_back(static_cast<char>(d));
+        }
+        return true;
+    }
+
+    FILE* f_{nullptr};
+    std::string buf_;
+    size_t pos_{0};
+    bool started_{false};
+};
 
 }  // namespace
 
@@ -171,64 +302,64 @@ void import_analysis(Db& db, const ImportOptions& opt) {
     };
 
     if (!opt.skip_callgraph) {
-        bool ok;
-        std::string content = read_file(opt.analysis_dir + "/call_graph.json", ok);
-        json_t* cg = ok ? json_loads(content.c_str(), 0, nullptr) : nullptr;
-        if (!cg) {
-            std::cerr << "[IMPORT] call_graph.json missing or invalid, skipped\n";
-        } else if (json_is_object(cg)) {
-            const char* caller;
-            json_t* v;
-            json_object_foreach(cg, caller, v) {
+        JsonObjectStream stream(opt.analysis_dir + "/call_graph.json");
+        if (!stream.ok()) {
+            std::cerr << "[IMPORT] call_graph.json not found, skipped\n";
+        } else {
+            std::string caller, value;
+            while (stream.next(caller, value)) {
                 auto it = name2keys.find(caller);
                 if (it == name2keys.end()) continue;
+                json_t* v = json_loads(value.c_str(), 0, nullptr);
+                if (!v) continue;
                 const json_t* calls = json_object_get(v, "calls");
-                if (!json_is_array(calls)) continue;
-                for (size_t i = 0; i < json_array_size(calls); ++i) {
-                    const json_t* c = json_array_get(calls, i);
-                    std::string callee = jstr(c, "function");
-                    std::string cfile = jstr(c, "file");
-                    if (callee.empty() || cfile.empty()) continue;
-                    std::string rel = relpath_of(cfile, opt.root);
-                    std::string okey = make_key(opt.project, rel, callee);
-                    note_endpoint(okey, callee, rel);
-                    for (const auto& skey : it->second) add_edge(skey, P_CALLS, okey);
+                if (json_is_array(calls)) {
+                    for (size_t i = 0; i < json_array_size(calls); ++i) {
+                        const json_t* c = json_array_get(calls, i);
+                        std::string callee = jstr(c, "function");
+                        std::string cfile = jstr(c, "file");
+                        if (callee.empty() || cfile.empty()) continue;
+                        std::string rel = relpath_of(cfile, opt.root);
+                        std::string okey = make_key(opt.project, rel, callee);
+                        note_endpoint(okey, callee, rel);
+                        for (const auto& skey : it->second) add_edge(skey, P_CALLS, okey);
+                    }
                 }
+                json_decref(v);
             }
-            json_decref(cg);
         }
     }
 
     if (!opt.skip_dataflow) {
-        bool ok;
-        std::string content = read_file(opt.analysis_dir + "/dataflow.json", ok);
-        json_t* df = ok ? json_loads(content.c_str(), 0, nullptr) : nullptr;
-        if (!df) {
-            std::cerr << "[IMPORT] dataflow.json missing or invalid, skipped\n";
-        } else if (json_is_object(df)) {
-            const char* var;
-            json_t* v;
-            json_object_foreach(df, var, v) {
+        JsonObjectStream stream(opt.analysis_dir + "/dataflow.json");
+        if (!stream.ok()) {
+            std::cerr << "[IMPORT] dataflow.json not found, skipped\n";
+        } else {
+            std::string var, value;
+            while (stream.next(var, value)) {
+                json_t* v = json_loads(value.c_str(), 0, nullptr);
+                if (!v) continue;
                 std::string vkey = "/code/local/" + opt.project + "/vars/" + var;
                 stub_vars.emplace(vkey, var);
                 const json_t* occ = json_object_get(v, "occurrences");
-                if (!json_is_array(occ)) continue;
-                for (size_t i = 0; i < json_array_size(occ); ++i) {
-                    const json_t* o = json_array_get(occ, i);
-                    std::string ffile = jstr(o, "file");
-                    std::string ffunc = jstr(o, "func");
-                    std::string type = jstr(o, "type");
-                    if (ffile.empty() || ffunc.empty()) continue;
-                    std::string rel = relpath_of(ffile, opt.root);
-                    std::string fkey = make_key(opt.project, rel, ffunc);
-                    note_endpoint(fkey, ffunc, rel);
-                    const char* pred = P_USES;
-                    if (type == "definition") pred = P_DEFINES;
-                    else if (type == "assignment") pred = P_ASSIGNS;
-                    add_edge(fkey, pred, vkey);
+                if (json_is_array(occ)) {
+                    for (size_t i = 0; i < json_array_size(occ); ++i) {
+                        const json_t* o = json_array_get(occ, i);
+                        std::string ffile = jstr(o, "file");
+                        std::string ffunc = jstr(o, "func");
+                        std::string type = jstr(o, "type");
+                        if (ffile.empty() || ffunc.empty()) continue;
+                        std::string rel = relpath_of(ffile, opt.root);
+                        std::string fkey = make_key(opt.project, rel, ffunc);
+                        note_endpoint(fkey, ffunc, rel);
+                        const char* pred = P_USES;
+                        if (type == "definition") pred = P_DEFINES;
+                        else if (type == "assignment") pred = P_ASSIGNS;
+                        add_edge(fkey, pred, vkey);
+                    }
                 }
+                json_decref(v);
             }
-            json_decref(df);
         }
     }
 
