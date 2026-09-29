@@ -332,10 +332,12 @@ export KNOWLEDGE_VECTOR_CMD="./tools/vector_provider_books.sh"
 - `paths`：关系路径的**节点序列**（从起点到终点），带深度
 - `related`：**语义搜索近邻**（来自外挂向量引擎，按 score 降序）
 
-### `knowledge search <query> [--k N] [--where <jse>]`
+### `knowledge search <query> [--k N] [--where <jse>] [--vector-cmd <cmd>]`
 
-混合检索：向量候选（外挂引擎）+ 全文候选（`$fti`）→ **RRF 融合** → PG 标量过滤。
-结果带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`，便于判断命中来源。
+混合检索：向量候选 + 全文候选（`$fti`）→ **RRF 融合** → PG 标量过滤。
+- **默认**：`embed_query.sh` 嵌入查询 → **pgvector `$knn`**（PG 内），`source=pgvector+fti`
+- **`--vector-cmd`**：改用外挂引擎，`source=vector+fti`
+- 结果带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`，便于判断命中来源。
 
 ### 向量引擎接入（provider 契约）
 

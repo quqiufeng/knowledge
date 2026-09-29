@@ -321,6 +321,9 @@ Agent 把本库当长期记忆。写入是**受控 Action**（本地 CLI），�
   与标量/图过滤在**同一条 SQL**；`qsearch` 用 `tools/embed_query.sh`（复用 Jina 模型）把查询文本转向量。
 - 已实测：redis 10658 向量，`qsearch` 与外挂引擎结果一致。
 
+**统一入口**：`search` 默认走 pgvector —— 嵌入查询后，向量候选来自 PG 内的 `$knn`，全文候选来自 `$fti`，RRF 在应用层融合；
+`--vector-cmd` 才回退到外挂引擎。`qsearch` 是纯 pgvector KNN 的直查。两条向量路径不再割裂。
+
 ## 6. 安全模型
 
 | 风险 | 对策 |
@@ -411,7 +414,9 @@ design.md             # 本文档
 - [x] **Agent 记忆（Action 层，本地）**：`remember`/`fact`/`link`/`forget`；情景事件 + 键值事实；覆盖即归档（`/@archive` + `/pred/supersedes`）；`/mem/{agent}` 命名空间；provenance 自动注入
 - [x] **口径注入修复**：查询默认 `AND is_active`（此前只是文档承诺未实现），`$include_archived` 可关闭
 - [x] **通用实体导入**：`import-records`（JSONL/CSV → 条目）
-- [x] **向量进 PG（pgvector）**：`embedding VECTOR(768)` + HNSW；`import-vectors`；`$knn` 算子；`tools/embed_query.sh` + `qsearch`（redis 实测与外挂引擎一致）
+- [x] **向量进 PG（pgvector）**：`embedding VECTOR(768)` + HNSW；`import-vectors`（含 bin/meta 名称校验）；`$knn` 算子（距离为主序）；`tools/embed_query.sh` + `qsearch`
+- [x] **检索统一**：`search` 默认 pgvector（`$knn` + `$fti` RRF），`--vector-cmd` 回退外挂；`source=pgvector+fti` / `vector+fti`
+- [x] **Makefile 依赖跟踪**：`-MMD -MP` + `-include *.d`（此前改头文件不重编导致链接错误）
 
 ### 进行中 🚧
 

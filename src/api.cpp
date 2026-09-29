@@ -79,11 +79,46 @@ void trim_definition(json_t* defs, bool no_content, long max_bytes) {
 }  // namespace
 
 json_t* api_search(Db& db, const std::string& query, int k, const std::string& vector_cmd,
-                   const std::string& scalar_json) {
-    std::vector<VectorHit> hits = run_vector_provider(vector_cmd, query, k);
-
+                   const std::string& scalar_json, const std::vector<float>& qvec) {
     json_error_t err;
     std::unordered_map<std::string, long long> cache;
+    std::vector<VectorHit> hits;
+
+    if (!qvec.empty()) {
+        // pgvector path: vector candidates from the DB itself.
+        json_t* varr = json_array();
+        for (float f : qvec) json_array_append_new(varr, json_real(f));
+        json_t* knn = json_object();
+        json_object_set_new(knn, "vector", varr);
+        json_object_set_new(knn, "k", json_integer(k));
+        json_t* knn_node = json_object();
+        json_object_set_new(knn_node, "$knn", knn);
+        json_t* and_arr = json_array();
+        json_array_append_new(and_arr, knn_node);
+        if (!scalar_json.empty()) {
+            json_t* extra = json_loads(scalar_json.c_str(), 0, &err);
+            if (!extra) throw std::runtime_error(std::string("[INPUT] invalid scalar JSE: ") + err.text);
+            json_array_append_new(and_arr, extra);
+        }
+        json_t* inner = json_object();
+        json_object_set_new(inner, "$and", and_arr);
+        json_t* q = json_object();
+        json_object_set_new(q, "$where", inner);
+        json_t* proj = json_array();
+        json_array_append_new(proj, json_string("key"));
+        json_object_set_new(q, "$project", proj);
+        json_object_set_new(q, "$limit", json_integer(k));
+        CompiledQuery cq = compile_query(q, make_options(db, {}, cache));
+        json_t* vrows = db.query_json(cq.sql, cq.params);
+        for (size_t i = 0; i < json_array_size(vrows); ++i) {
+            const json_t* rk = json_object_get(json_array_get(vrows, i), "key");
+            if (json_is_string(rk)) hits.push_back(VectorHit{json_string_value(rk), 0.0});
+        }
+        json_decref(vrows);
+        json_decref(q);
+    } else {
+        hits = run_vector_provider(vector_cmd, query, k);
+    }
 
     std::vector<std::string> lex_keys;
     {
@@ -194,7 +229,8 @@ json_t* api_search(Db& db, const std::string& query, int k, const std::string& v
         if (vs != vscore.end()) json_object_set_new(row, "vector_score", json_real(vs->second));
     }
 
-    json_object_set_new(out, "source", json_string(vector_cmd.empty() ? "pg+fti" : "vector+fti"));
+    const char* source = !qvec.empty() ? "pgvector+fti" : (vector_cmd.empty() ? "pg+fti" : "vector+fti");
+    json_object_set_new(out, "source", json_string(source));
     json_object_set_new(out, "results", rows);
     return out;
 }

@@ -167,6 +167,19 @@ std::string run_cmd(const std::string& cmd) {
     return out;
 }
 
+std::vector<float> parse_float_vector(const std::string& text) {
+    std::vector<float> out;
+    json_t* arr = json_loads(text.c_str(), 0, nullptr);
+    if (json_is_array(arr)) {
+        for (size_t i = 0; i < json_array_size(arr); ++i) {
+            const json_t* e = json_array_get(arr, i);
+            if (json_is_number(e)) out.push_back(static_cast<float>(json_number_value(e)));
+        }
+    }
+    if (arr) json_decref(arr);
+    return out;
+}
+
 void split_csv(const std::string& s, std::vector<std::string>& out) {
     size_t start = 0;
     while (start <= s.size()) {
@@ -183,7 +196,8 @@ int usage() {
                  "  tokenize <text>\n"
                  "  compile  [--vectors <json>]                 (JSE from stdin)\n"
                  "  query    [--vectors <json>]                 (JSE from stdin, runs against PG)\n"
-                 "  search   <query> [--k N] [--where <jse>] [--vector-cmd <cmd>]\n"
+                 "  search   <query> [--k N] [--where <jse>] [--vector-cmd <cmd>] [--embed-cmd <cmd>]\n"
+                 "           (default: embed query + pgvector; --vector-cmd uses the external engine)\n"
                  "  context  <key>   [--depth N] [--k N] [--predicate <key>]\n"
                  "                   [--no-content] [--max-code-bytes N] [--vector-cmd <cmd>]\n"
                  "  import   --analysis-dir <dir> --project <p> --root <r>\n"
@@ -266,8 +280,20 @@ int main(int argc, char** argv) {
             if (pos.empty()) return usage();
             int k = opt_int("k", 20);
             std::string scalar = opts.count("where") ? opts["where"] : "";
+            std::vector<float> qvec;
+            if (!opts.count("vector-cmd")) {
+                // Default: embed the query and use pgvector for vector candidates.
+                std::string embed_cmd = opts.count("embed-cmd")
+                                            ? opts["embed-cmd"]
+                                            : env_or("KNOWLEDGE_EMBED_CMD", "./tools/embed_query.sh");
+                try {
+                    qvec = parse_float_vector(run_cmd(embed_cmd + " " + sh_quote(pos[0])));
+                } catch (const std::exception&) {
+                    qvec.clear();
+                }
+            }
             Db db(default_conninfo());
-            json_t* r = api_search(db, pos[0], k, vector_cmd, scalar);
+            json_t* r = api_search(db, pos[0], k, vector_cmd, scalar, qvec);
             std::cout << json_dump(r, JSON_INDENT(2)) << std::endl;
             json_decref(r);
             return 0;
