@@ -497,29 +497,32 @@ CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
         projection = alias + ".id, " + alias + ".key, " + alias + ".meta";
     }
 
-    std::string order_sql;
+    // KNN distance is always the primary sort; user $order becomes secondary.
+    std::vector<std::string> order_terms;
+    if (!ctx.knn_order.empty()) order_terms.push_back(ctx.knn_order + " ASC");
     const json_t* order = json_object_get(query, "$order");
     if (json_is_object(order) && json_object_size(order) > 0) {
-        order_sql = " ORDER BY ";
-        size_t idx = 0;
         void* iter = json_object_iter(const_cast<json_t*>(order));
         while (iter) {
             const char* k = json_object_iter_key(iter);
             const json_t* val = json_object_iter_value(iter);
-            if (idx++) order_sql += ", ";
             if (!json_is_string(val)) throw std::runtime_error("[JSE] $order values must be 'asc'/'desc'");
             if (std::string(k) == "$search_score" && !ctx.has_search)
                 throw std::runtime_error("[JSE] $order $search_score requires a $search node");
-            order_sql += order_expr(ctx, alias, k, json_string_value(val));
+            order_terms.push_back(order_expr(ctx, alias, k, json_string_value(val)));
             iter = json_object_iter_next(const_cast<json_t*>(order), iter);
         }
     }
-
-    bool knn_needs_limit = false;
-    if (order_sql.empty() && !ctx.knn_order.empty()) {
-        order_sql = " ORDER BY " + ctx.knn_order + " ASC";
-        knn_needs_limit = true;
+    std::string order_sql;
+    if (!order_terms.empty()) {
+        order_sql = " ORDER BY ";
+        for (size_t i = 0; i < order_terms.size(); ++i) {
+            if (i) order_sql += ", ";
+            order_sql += order_terms[i];
+        }
     }
+
+    bool knn_needs_limit = !ctx.knn_order.empty();
 
     json_int_t limit = 100;
     const json_t* limit_v = json_object_get(query, "$limit");

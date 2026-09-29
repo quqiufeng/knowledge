@@ -67,13 +67,14 @@ long import_vectors(Db& db, const EmbedOptions& opt) {
 
     std::vector<float> vec(dim);
     std::string line;
+    long mismatch = 0;
     while (std::getline(meta, line)) {
         // read one bin record: uint32 name_len, name, dim floats
         uint32_t name_len = 0;
         if (!bin.read(reinterpret_cast<char*>(&name_len), 4)) break;
         if (name_len > (1u << 20)) break;
-        std::string name(name_len, '\0');
-        if (!bin.read(&name[0], name_len)) break;
+        std::string bin_name(name_len, '\0');
+        if (!bin.read(&bin_name[0], name_len)) break;
         if (!bin.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(float))) break;
 
         if (line.empty()) continue;
@@ -86,6 +87,12 @@ long import_vectors(Db& db, const EmbedOptions& opt) {
         std::string file = jstr(d, "file");
         json_decref(d);
         if (fname.empty() || file.empty()) continue;
+
+        // Guard against silent misalignment: the bin record must belong to this meta line.
+        if (bin_name != fname) {
+            mismatch++;
+            continue;
+        }
 
         std::string key = make_key(opt.project, kutil::relpath_of(file, opt.root), fname);
         buf += kutil::escape_copy(key) + "\t" + kutil::escape_copy(vec_literal(vec.data(), dim)) + "\n";
@@ -105,5 +112,7 @@ long import_vectors(Db& db, const EmbedOptions& opt) {
         db.exec("CREATE INDEX idx_knowledge_emb ON knowledge USING hnsw (embedding vector_cosine_ops)");
     db.exec("DROP TABLE stg_vec");
     db.exec("COMMIT");
+    if (mismatch > 0)
+        std::fprintf(stderr, "[EMBED] WARN: %ld records skipped (bin/meta name mismatch)\n", mismatch);
     return rows;
 }
