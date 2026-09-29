@@ -444,6 +444,9 @@ design.md             # 本文档
 
 - [ ] **多项目批量导入**：16 个仓库（约 250 万 chunk），分项目串行导入 + 校验
 
+- [ ] **对照语料导出**：`export --preset pairs`（概念 → 跨项目多实现对照样本）
+- [ ] **评测脚本**：从图留出边/NL→key，用知识库当 ground truth 判分；按 `project/file/version` 防泄漏切分
+
 ### 待办 ⏳
 
 - [ ] **迁移对账（第三弹 E14）**：mmap 旧系统 vs PG 新系统的双跑 diff 与灰度切流
