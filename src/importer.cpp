@@ -258,14 +258,14 @@ void import_analysis(Db& db, const ImportOptions& opt) {
     double t0 = now_s();
 
     // Pass A: collect caller names so name2keys only stores names the call graph needs.
-    std::unordered_set<std::string> caller_names;
+    std::unordered_set<std::string> callee_names;
     if (!opt.skip_callgraph) {
         JsonObjectStream cs(opt.analysis_dir + "/call_graph.json");
         if (cs.ok()) {
             std::string ck, cv;
-            while (cs.next(ck, cv)) caller_names.insert(ck);
+            while (cs.next(ck, cv)) callee_names.insert(ck);
         }
-        std::cerr << "[IMPORT] caller names: " << caller_names.size() << " (" << (now_s() - t0) << "s)\n";
+        std::cerr << "[IMPORT] callee names: " << callee_names.size() << " (" << (now_s() - t0) << "s)\n";
     }
 
     db.exec("BEGIN");
@@ -314,7 +314,7 @@ void import_analysis(Db& db, const ImportOptions& opt) {
 
             if (known_keys.insert(hash64(key)).second) {
                 add_knowledge(key, meta, content, terms);
-                if (!opt.skip_callgraph && caller_names.count(name)) name2keys[name].push_back(key);
+                if (!opt.skip_callgraph && callee_names.count(name)) name2keys[name].push_back(key);
                 chunk_count++;
             }
         }
@@ -345,26 +345,29 @@ void import_analysis(Db& db, const ImportOptions& opt) {
         if (!stream.ok()) {
             std::cerr << "[IMPORT] call_graph.json not found, skipped\n";
         } else {
-            std::string caller, value;
-            while (stream.next(caller, value)) {
-                auto it = name2keys.find(caller);
+            // my_db call_graph.json is keyed by CALLEE; each "calls" entry is a CALLER
+            // (with the caller's file/line). Resolve the callee by name; the caller key
+            // is exact from its file.
+            std::string callee_name, value;
+            while (stream.next(callee_name, value)) {
+                auto it = name2keys.find(callee_name);
                 if (it == name2keys.end()) continue;
+                // Ambiguous callee names (same name in many files) produce false edges;
+                // skip them unless fan-out is explicitly requested.
+                if (it->second.size() > 1 && !opt.fanout) continue;
                 json_t* v = json_loads(value.c_str(), 0, nullptr);
                 if (!v) continue;
                 const json_t* calls = json_object_get(v, "calls");
                 if (json_is_array(calls)) {
                     for (size_t i = 0; i < json_array_size(calls); ++i) {
                         const json_t* c = json_array_get(calls, i);
-                        std::string callee = jstr(c, "function");
-                        std::string cfile = jstr(c, "file");
-                        if (callee.empty() || cfile.empty()) continue;
-                        std::string rel = relpath_of(cfile, opt.root);
-                        std::string okey = make_key(opt.project, rel, callee);
-                        note_endpoint(okey, callee, rel);
-                        // Ambiguous caller names (same name in many files) produce false
-                        // edges; skip them unless fan-out is explicitly requested.
-                        if (it->second.size() > 1 && !opt.fanout) continue;
-                        for (const auto& skey : it->second) add_edge(skey, P_CALLS, okey);
+                        std::string caller_name = jstr(c, "function");
+                        std::string caller_file = jstr(c, "file");
+                        if (caller_name.empty() || caller_file.empty()) continue;
+                        std::string rel = relpath_of(caller_file, opt.root);
+                        std::string skey = make_key(opt.project, rel, caller_name);
+                        note_endpoint(skey, caller_name, rel);
+                        for (const auto& okey : it->second) add_edge(skey, P_CALLS, okey);
                     }
                 }
                 json_decref(v);
