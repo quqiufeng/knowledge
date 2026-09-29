@@ -72,6 +72,8 @@ JSE 算子是 AI 与存储层之间的**契约**：存储引擎（PostgreSQL / �
 | 电子书导入器（`/opt/books` Markdown → 条目+三元组） | ✅ 完成（7 本 / 2445 页 / 3382 边，2.5s） |
 | 一键流水线 `tools/ingest.sh`（分析 + 入库） | ✅ 完成 |
 | token 友好输出（嵌套 meta/content + 字段裁剪 + `--no-content`） | ✅ 完成 |
+| 混合检索（向量 + 全文 RRF 融合） | ✅ 完成 |
+| 编译期 key→id 解析、`$k-hop` 结果上限、回归测试 | ✅ 完成 |
 | 多项目批量导入（16 仓库 / ~250 万 chunk） | 🚧 进行中 |
 | smoke test / 迁移对账 / 规范校验 / Action 层 | ⏳ 待办 |
 
@@ -182,8 +184,11 @@ export KNOWLEDGE_VECTOR_CMD="./tools/vector_provider.sh"
 export ANALYSIS_DIR=/opt/code_caches/redis_cache PROJECT=redis ROOT=/opt/redis
 
 ./knowledge search "memory pool allocation" --k 5
-# -> [{ key, meta.symbol, meta.file, meta.line, meta.signature, score }]
+# -> [{ key, meta.symbol, .file, .line, .signature,
+#       rrf, vector_rank, vector_score, lexical_rank }]
 ```
+
+`search` 做**混合检索**：向量候选（外挂引擎）+ 全文候选（`$fti`），用 RRF 融合排序。
 
 典型过程：**先用一段自然语言描述功能**，拿到候选 `key`，再对目标 key 取上下文。
 
@@ -269,7 +274,8 @@ export KNOWLEDGE_VECTOR_CMD="./tools/vector_provider_books.sh"
 
 ### `knowledge search <query> [--k N] [--where <jse>]`
 
-语义搜索 + PG 标量过滤的融合结果。
+混合检索：向量候选（外挂引擎）+ 全文候选（`$fti`）→ **RRF 融合** → PG 标量过滤。
+结果带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`，便于判断命中来源。
 
 ### 向量引擎接入（provider 契约）
 
@@ -302,6 +308,7 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 - `$search`：向量（外挂引擎提供 `vectors` 候选，按 `$search_score` 排序）
 - `$triple`：`subject` / `predicate` / `object` 边匹配；`direction`（`out` 沿指定 subject 的出边 / `in` 入边 / `both` 默认两端）
 - `$k-hop`：`from` / `predicates` / `depth` / `direction` / `where`，ID 拓扑遍历 + path 防环
+- 排序键：`$search_score`（需 `$search`）、`$fti_rank`（需 `$fti`，用 `ts_rank`）
 - 修饰符：`$project` / `$order` / `$limit` / `$offset`
 
 ### 路径约定

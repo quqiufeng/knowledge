@@ -7,7 +7,9 @@
 
 #include <jansson.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -115,8 +117,37 @@ void seed(Db& db) {
     link_triple(db, alloc, p_calls, slowpath);
 }
 
+std::function<bool(const std::string&, long long&)> make_resolver(
+    Db& db, std::unordered_map<std::string, long long>& cache) {
+    return [&db, &cache](const std::string& key, long long& id) -> bool {
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            id = it->second;
+            return true;
+        }
+        json_t* rows = db.query_json("SELECT id FROM knowledge WHERE key = $1", {key});
+        bool found = json_array_size(rows) > 0;
+        if (found) {
+            const json_t* v = json_object_get(json_array_get(rows, 0), "id");
+            id = std::atoll(json_string_value(v));
+            cache[key] = id;
+        }
+        json_decref(rows);
+        return found;
+    };
+}
+
+CompileOptions make_options(Db& db, const std::vector<VectorHit>& vectors,
+                            std::unordered_map<std::string, long long>& cache) {
+    CompileOptions opts;
+    opts.vectors = vectors;
+    opts.resolve_key = make_resolver(db, cache);
+    return opts;
+}
+
 void run_query(Db& db, const json_t* query, const std::vector<VectorHit>& vectors, bool execute) {
-    CompiledQuery cq = compile_query(query, vectors);
+    std::unordered_map<std::string, long long> cache;
+    CompiledQuery cq = compile_query(query, make_options(db, vectors, cache));
     if (!execute) {
         json_t* out = json_object();
         json_object_set_new(out, "sql", json_string(cq.sql.c_str()));
@@ -157,6 +188,64 @@ void cmd_search(Db& db, const std::string& query, int k, const std::string& vect
     std::vector<VectorHit> hits = run_vector_provider(vector_cmd, query, k);
 
     json_error_t err;
+    std::unordered_map<std::string, long long> cache;
+
+    std::vector<std::string> lex_keys;
+    {
+        json_t* lq = json_object();
+        json_t* lwhere = json_object();
+        json_object_set_new(lwhere, "$fti", json_string(query.c_str()));
+        json_object_set_new(lq, "$where", lwhere);
+        json_t* lproj = json_array();
+        json_array_append_new(lproj, json_string("key"));
+        json_object_set_new(lq, "$project", lproj);
+        json_t* lorder = json_object();
+        json_object_set_new(lorder, "$fti_rank", json_string("desc"));
+        json_object_set_new(lq, "$order", lorder);
+        json_object_set_new(lq, "$limit", json_integer(k));
+        CompiledQuery lc = compile_query(lq, make_options(db, {}, cache));
+        json_t* lrows = db.query_json(lc.sql, lc.params);
+        for (size_t i = 0; i < json_array_size(lrows); ++i) {
+            const json_t* rk = json_object_get(json_array_get(lrows, i), "key");
+            if (json_is_string(rk)) lex_keys.push_back(json_string_value(rk));
+        }
+        json_decref(lrows);
+        json_decref(lq);
+    }
+
+    const double RRF_K = 60.0;
+    std::unordered_map<std::string, double> rrf;
+    std::unordered_map<std::string, int> vrank, lrank;
+    std::unordered_map<std::string, double> vscore;
+    for (size_t i = 0; i < hits.size(); ++i) {
+        rrf[hits[i].key] += 1.0 / (RRF_K + static_cast<double>(i + 1));
+        vrank[hits[i].key] = static_cast<int>(i + 1);
+        vscore[hits[i].key] = hits[i].score;
+    }
+    for (size_t i = 0; i < lex_keys.size(); ++i) {
+        const std::string& key = lex_keys[i];
+        rrf[key] += 1.0 / (RRF_K + static_cast<double>(i + 1));
+        if (!lrank.count(key)) lrank[key] = static_cast<int>(i + 1);
+    }
+
+    std::vector<VectorHit> fused;
+    for (const auto& kv : rrf) fused.push_back(VectorHit{kv.first, kv.second});
+    std::sort(fused.begin(), fused.end(), [](const VectorHit& a, const VectorHit& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.key < b.key;
+    });
+    if (static_cast<int>(fused.size()) > k) fused.resize(k);
+
+    json_t* out = json_object();
+    json_object_set_new(out, "query", json_string(query.c_str()));
+    if (fused.empty()) {
+        json_object_set_new(out, "source", json_string("none"));
+        json_object_set_new(out, "results", json_array());
+        std::cout << json_dump(out, JSON_INDENT(2)) << std::endl;
+        json_decref(out);
+        return;
+    }
+
     json_t* body = json_object();
     json_t* and_arr = json_array();
     json_t* search_inner = json_object();
@@ -165,10 +254,12 @@ void cmd_search(Db& db, const std::string& query, int k, const std::string& vect
     json_t* search_node = json_object();
     json_object_set_new(search_node, "$search", search_inner);
     json_array_append_new(and_arr, search_node);
-
     if (!scalar_json.empty()) {
         json_t* extra = json_loads(scalar_json.c_str(), 0, &err);
-        if (!extra) throw std::runtime_error(std::string("[INPUT] invalid scalar JSE: ") + err.text);
+        if (!extra) {
+            json_decref(out);
+            throw std::runtime_error(std::string("[INPUT] invalid scalar JSE: ") + err.text);
+        }
         json_array_append_new(and_arr, extra);
     }
     json_t* where = json_object();
@@ -187,22 +278,25 @@ void cmd_search(Db& db, const std::string& query, int k, const std::string& vect
     json_object_set_new(body, "$order", order);
     json_object_set_new(body, "$limit", json_integer(k));
 
-    CompiledQuery cq = compile_query(body, hits);
+    CompiledQuery cq = compile_query(body, make_options(db, fused, cache));
     json_t* rows = db.query_json(cq.sql, cq.params);
 
-    std::unordered_map<std::string, double> score_of;
-    for (const auto& h : hits) score_of[h.key] = h.score;
     for (size_t i = 0; i < json_array_size(rows); ++i) {
         json_t* row = json_array_get(rows, i);
         const json_t* rk = json_object_get(row, "key");
         if (!json_is_string(rk)) continue;
-        auto it = score_of.find(json_string_value(rk));
-        if (it != score_of.end()) json_object_set_new(row, "score", json_real(it->second));
+        std::string key = json_string_value(rk);
+        auto it = rrf.find(key);
+        if (it != rrf.end()) json_object_set_new(row, "rrf", json_real(it->second));
+        auto vr = vrank.find(key);
+        if (vr != vrank.end()) json_object_set_new(row, "vector_rank", json_integer(vr->second));
+        auto lr = lrank.find(key);
+        if (lr != lrank.end()) json_object_set_new(row, "lexical_rank", json_integer(lr->second));
+        auto vs = vscore.find(key);
+        if (vs != vscore.end()) json_object_set_new(row, "vector_score", json_real(vs->second));
     }
 
-    json_t* out = json_object();
-    json_object_set_new(out, "query", json_string(query.c_str()));
-    json_object_set_new(out, "source", json_string(vector_cmd.empty() ? "pg-only" : "external-vector"));
+    json_object_set_new(out, "source", json_string(vector_cmd.empty() ? "pg+fti" : "vector+fti"));
     json_object_set_new(out, "results", rows);
     std::cout << json_dump(out, JSON_INDENT(2)) << std::endl;
     json_decref(out);

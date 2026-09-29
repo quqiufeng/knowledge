@@ -27,6 +27,7 @@ rejects "echo '{\"\$where\":{\"\$meta\":{\"path\":\"kind\"}}}' | $BIN compile" "
 rejects "echo '{\"\$where\":{\"\$and\":[{\"\$fti\":\"a\"}],\"\$fti\":\"b\"}}' | $BIN compile" "multiple operators rejected"
 rejects "echo '{\"\$where\":{\"\$meta\":{\"path\":\"kind; DROP TABLE knowledge;--\",\"\$eq\":\"x\"}}}' | $BIN compile" "path injection rejected"
 rejects "echo '{\"\$where\":{\"\$fti\":\"a\"},\"\$order\":{\"\$search_score\":\"desc\"}}' | $BIN compile" "\$search_score requires \$search"
+rejects "echo '{\"\$where\":{\"\$meta\":{\"path\":\"lang\",\"\$eq\":\"c\"}},\"\$order\":{\"\$fti_rank\":\"desc\"}}' | $BIN compile" "\$fti_rank requires \$fti"
 rejects "echo '{\"\$where\":{\"\$triple\":{}}}' | $BIN compile" "\$triple without endpoint rejected"
 
 echo "[smoke] postgres"
@@ -49,6 +50,12 @@ else
     ok "\$triple direction out excludes anchor"
 fi
 
+compiled=$(echo '{"$where":{"$triple":{"subject":"/code/local/linux/mm/page_alloc.c/__alloc_pages_slowpath","predicate":"/pred/calls","direction":"out"}},"$project":["key"]}' | $BIN compile)
+has '"params": \[\]' "$compiled" "key resolver emits integer literals (no params)"
+
+hybrid=$($BIN search "alloc pages" --k 3 --vector-cmd ./tools/vector_provider_stub.sh 2>&1)
+has '"rrf"' "$hybrid" "hybrid search emits rrf score"
+
 echo "[smoke] vector provider robustness"
 
 noisy=$(mktemp /tmp/vp_noisy.XXXXXX.sh)
@@ -58,7 +65,7 @@ echo "[INFO] model warmup"
 echo '{"results":[{"key":"/code/local/linux/mm/page_alloc.c/alloc_pages","score":0.9}]}'
 EOF
 chmod +x "$noisy"
-out=$($BIN search "memory" --k 1 --vector-cmd "$noisy" 2>&1)
+out=$($BIN search "memory" --k 5 --vector-cmd "$noisy" 2>&1)
 has 'alloc_pages' "$out" "search tolerates noisy provider output"
 rm -f "$noisy"
 

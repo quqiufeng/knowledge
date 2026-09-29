@@ -23,9 +23,11 @@ const std::unordered_set<std::string>& base_columns() {
 struct Ctx {
     std::vector<std::string> params;
     bool has_search{false};
+    std::string fti_tsq;
+    const std::function<bool(const std::string&, long long&)>* resolve_key{nullptr};
 };
 
-std::string bind(Ctx& ctx, const std::string& text) {
+std::string bind_param(Ctx& ctx, const std::string& text) {
     ctx.params.push_back(text);
     return "$" + std::to_string(ctx.params.size());
 }
@@ -120,9 +122,9 @@ std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias)
         if (json_is_null(v)) {
             clauses.push_back(expr + " IS NULL");
         } else if (is_number(v)) {
-            clauses.push_back("(" + expr + ")::numeric = " + bind(ctx, value_to_text(v)));
+            clauses.push_back("(" + expr + ")::numeric = " + bind_param(ctx, value_to_text(v)));
         } else {
-            clauses.push_back(expr + " = " + bind(ctx, value_to_text(v)));
+            clauses.push_back(expr + " = " + bind_param(ctx, value_to_text(v)));
         }
     }
     v = json_object_get(meta, "$ne");
@@ -130,9 +132,9 @@ std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias)
         if (json_is_null(v)) {
             clauses.push_back(expr + " IS NOT NULL");
         } else if (is_number(v)) {
-            clauses.push_back("(" + expr + ")::numeric <> " + bind(ctx, value_to_text(v)));
+            clauses.push_back("(" + expr + ")::numeric <> " + bind_param(ctx, value_to_text(v)));
         } else {
-            clauses.push_back(expr + " <> " + bind(ctx, value_to_text(v)));
+            clauses.push_back(expr + " <> " + bind_param(ctx, value_to_text(v)));
         }
     }
 
@@ -142,7 +144,7 @@ std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias)
         v = json_object_get(meta, cmp_ops[i]);
         if (!v) continue;
         std::string lhs = is_number(v) ? "(" + expr + ")::numeric" : expr;
-        clauses.push_back(lhs + " " + cmp_sql[i] + " " + bind(ctx, value_to_text(v)));
+        clauses.push_back(lhs + " " + cmp_sql[i] + " " + bind_param(ctx, value_to_text(v)));
     }
 
     auto compile_set = [&](const char* key, bool negated) {
@@ -160,7 +162,7 @@ std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias)
         }
         std::string lit = numeric ? pg_numeric_array(items) : pg_text_array(items);
         std::string cast = numeric ? "::numeric[]" : "::text[]";
-        std::string clause = expr + " = ANY(" + bind(ctx, lit) + cast + ")";
+        std::string clause = expr + " = ANY(" + bind_param(ctx, lit) + cast + ")";
         if (negated) clause = "NOT (" + clause + ")";
         clauses.push_back(clause);
     };
@@ -184,7 +186,11 @@ std::string compile_meta(const json_t* meta, Ctx& ctx, const std::string& alias)
 }
 
 std::string key_id_subquery(Ctx& ctx, const std::string& key) {
-    return "(SELECT id FROM knowledge WHERE key = " + bind(ctx, key) + ")";
+    if (ctx.resolve_key) {
+        long long id = 0;
+        if ((*ctx.resolve_key)(key, id)) return std::to_string(id);
+    }
+    return "(SELECT id FROM knowledge WHERE key = " + bind_param(ctx, key) + ")";
 }
 
 bool require_object(const json_t* v, const char* what) {
@@ -250,8 +256,8 @@ std::string compile_khop(const json_t* hop, Ctx& ctx, const std::string& alias) 
     }
     if (preds.empty()) throw std::runtime_error("[JSE] $k-hop requires non-empty predicates");
 
-    std::string from_param = bind(ctx, json_string_value(from_v));
-    std::string pred_param = bind(ctx, pg_text_array(preds));
+    std::string from_param = bind_param(ctx, json_string_value(from_v));
+    std::string pred_param = bind_param(ctx, pg_text_array(preds));
 
     std::vector<std::string> inner = {"c.depth > 0"};
     const json_t* where = json_object_get(hop, "where");
@@ -272,7 +278,7 @@ std::string compile_khop(const json_t* hop, Ctx& ctx, const std::string& alias) 
         "AND st.predicate_id IN (SELECT id FROM knowledge WHERE key = ANY(" + pred_param + "::text[])) "
         "AND st.is_active AND NOT (st." + tgt + " = ANY(c.path))"
         ") SELECT c.current_id FROM chain c JOIN knowledge k ON k.id = c.current_id "
-        "WHERE " + inner_where + "))";
+        "WHERE " + inner_where + " LIMIT 20000))";
     return sql;
 }
 
@@ -316,7 +322,8 @@ std::string compile_node(const json_t* node, Ctx& ctx, const std::string& alias)
         std::vector<std::string> tokens = tokenize_code(json_string_value(v));
         if (tokens.empty()) return "(FALSE)";
         std::string tsq = build_ts_query(tokens);
-        return "(" + alias + ".search_tsv @@ to_tsquery('simple', " + bind(ctx, tsq) + "))";
+        if (ctx.fti_tsq.empty()) ctx.fti_tsq = tsq;
+        return "(" + alias + ".search_tsv @@ to_tsquery('simple', " + bind_param(ctx, tsq) + "))";
     }
     if (json_object_get(node, "$search")) {
         if (!ctx.has_search) throw std::runtime_error("[JSE] $search requires external vector results");
@@ -359,9 +366,13 @@ std::string project_expr(const std::string& alias, const std::string& path) {
     throw std::runtime_error("[JSE_SECURITY] invalid projection path: " + path);
 }
 
-std::string order_expr(const std::string& alias, const std::string& key, const std::string& dir) {
+std::string order_expr(Ctx& ctx, const std::string& alias, const std::string& key, const std::string& dir) {
     std::string upper = dir == "asc" ? "ASC" : "DESC";
     if (key == "$search_score") return "(SELECT score FROM vs WHERE vs.key = " + alias + ".key) " + upper;
+    if (key == "$fti_rank") {
+        if (ctx.fti_tsq.empty()) throw std::runtime_error("[JSE] $order $fti_rank requires an $fti node");
+        return "ts_rank(" + alias + ".search_tsv, to_tsquery('simple', " + bind_param(ctx, ctx.fti_tsq) + ")) " + upper;
+    }
     if (key.rfind("meta.", 0) == 0) return json_path_expr(alias, "meta", key.substr(5)) + " " + upper;
     if (base_columns().count(key)) return alias + "." + key + " " + upper;
     throw std::runtime_error("[JSE_SECURITY] invalid order key: " + key);
@@ -369,13 +380,15 @@ std::string order_expr(const std::string& alias, const std::string& key, const s
 
 }  // namespace
 
-CompiledQuery compile_query(const json_t* query, const std::vector<VectorHit>& vectors) {
+CompiledQuery compile_query(const json_t* query, const CompileOptions& opts) {
     if (!json_is_object(query)) throw std::runtime_error("[JSE] query must be an object");
     const json_t* where = json_object_get(query, "$where");
     if (!where) throw std::runtime_error("[JSE] query requires $where");
 
+    const std::vector<VectorHit>& vectors = opts.vectors;
     Ctx ctx;
-    std::string alias = "knowledge";
+    ctx.resolve_key = &opts.resolve_key;
+    std::string alias = opts.alias;
     std::string cte;
 
     if (ast_has_search(where)) {
@@ -383,7 +396,7 @@ CompiledQuery compile_query(const json_t* query, const std::vector<VectorHit>& v
         std::string rows;
         for (size_t i = 0; i < vectors.size(); ++i) {
             if (i) rows += ", ";
-            rows += "(" + bind(ctx, vectors[i].key) + "::text, " + bind(ctx, std::to_string(vectors[i].score)) + "::double precision)";
+            rows += "(" + bind_param(ctx, vectors[i].key) + "::text, " + bind_param(ctx, std::to_string(vectors[i].score)) + "::double precision)";
         }
         cte = "WITH vs(key, score) AS (VALUES " + rows + ") ";
         ctx.has_search = true;
@@ -418,7 +431,7 @@ CompiledQuery compile_query(const json_t* query, const std::vector<VectorHit>& v
             if (!json_is_string(val)) throw std::runtime_error("[JSE] $order values must be 'asc'/'desc'");
             if (std::string(k) == "$search_score" && !ctx.has_search)
                 throw std::runtime_error("[JSE] $order $search_score requires a $search node");
-            order_sql += order_expr(alias, k, json_string_value(val));
+            order_sql += order_expr(ctx, alias, k, json_string_value(val));
             iter = json_object_iter_next(const_cast<json_t*>(order), iter);
         }
     }

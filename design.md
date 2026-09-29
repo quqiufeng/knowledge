@@ -233,7 +233,20 @@ C++ 侧 `src/vector.cpp` 用 `popen` 调用并解析，结果喂给 `compile_que
 | `paths` | 调用路径节点序列（起点→终点，带 depth） | 递归 CTE（text[] 累积 key） |
 | `related` | 语义近邻 + score | 外挂向量引擎 + PG 回填 |
 
-`knowledge search <query>` 则是语义搜索 + 标量过滤的融合出口。二者构成"本项目只供上下文、不产语料"的边界。
+`knowledge search <query>` 则是检索出口。二者构成"本项目只供上下文、不产语料"的边界。
+
+### 5.4 混合检索（RRF）
+
+`search` 同时取两路候选并融合：
+
+| 路 | 来源 | 排序依据 |
+|---|---|---|
+| 向量 | 外挂引擎（provider） | 余弦相似度 |
+| 全文 | PG `search_tsv` + `to_tsquery` | `$fti_rank`（`ts_rank`） |
+
+融合用 **RRF（Reciprocal Rank Fusion）**：`score(key) = Σ 1/(60 + rank_i)`，取 Top-K 后过 PG 标量过滤。
+结果附带 `rrf` / `vector_rank` / `lexical_rank` / `vector_score`，便于判断命中来源与调试。
+RRF 让"向量召回但全文未命中"与"全文精确但向量偏离"两类结果互补，优于单一排序。
 
 ---
 
@@ -305,7 +318,10 @@ design.md             # 本文档
 - [x] **token 友好输出**：`meta`/`content` 返回嵌套对象（不再双重转义）；`search` 默认回 `key/symbol/file/line/signature/score`；`context` 支持 `--no-content` / `--max-code-bytes`
 - [x] **电子书输入源**：`knowledge import-books`，`/opt/books/{book}/chapters/**/page_*.md` → book/chapter/page 条目 + `contains` 关系；`tools/vector_provider_books.sh` 接入 book 向量（key 与 `cache_query` 的 `name` 天然对齐）
 - [x] **代码复盘加固**：修复 `$search_score` 无 `$search` 的非法 SQL；拒绝一个节点含多个算子；`$triple` 增加 `direction`（out/in/both）且语义修正；provider 容忍杂音输出；公共工具抽到 `src/util.hpp`；书籍正文不再整页写入 `search_tsv`（截断 4KB）
-- [x] **回归测试**：`tests/smoke.sh` + `make test`（编译器 + PG 端到端 + provider 健壮性，13 项）
+- [x] **回归测试**：`tests/smoke.sh` + `make test`（编译器 + PG 端到端 + provider 健壮性，16 项）
+- [x] **编译期 key→id 解析**：`CompileOptions::resolve_key`，已知 key 直接产出整数 id 字面量（省去每个条件的子查询），未命中回退子查询
+- [x] **`$k-hop` 结果上限**：递归子查询尾部 `LIMIT 20000`，防扇出爆炸
+- [x] **混合检索（RRF）**：`search` = 向量候选 + 全文候选（`$fti` + `$fti_rank`），RRF 融合后过标量过滤；结果带 `rrf/vector_rank/lexical_rank/vector_score`
 
 ### 进行中 🚧
 
