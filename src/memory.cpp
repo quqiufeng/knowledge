@@ -1,5 +1,6 @@
 #include "memory.hpp"
 
+#include "action.hpp"
 #include "util.hpp"
 
 #include <jansson.h>
@@ -87,6 +88,7 @@ std::string memory_remember(Db& db, const std::string& agent, const std::string&
 
     upsert_memory(db, key, kutil::dump_owned(meta), kutil::dump_owned(content), text);
     for (const auto& a : about) link(db, key, P_ABOUT, a);
+    audit(db, agent, "remember", key, "");
     return key;
 }
 
@@ -132,14 +134,16 @@ std::string memory_fact(Db& db, const std::string& agent, const std::string& top
 
     std::string value_text = value_json;
     upsert_memory(db, key, kutil::dump_owned(meta), kutil::dump_owned(content), value_text);
+    audit(db, agent, "fact", key, "");
     return key;
 }
 
-long memory_link(Db& db, const std::string& subject, const std::string& predicate,
-                 const std::string& object) {
+long memory_link(Db& db, const std::string& agent, const std::string& subject,
+                 const std::string& predicate, const std::string& object) {
     if (subject.empty() || predicate.empty() || object.empty())
         throw std::runtime_error("[MEMORY] link needs subject, predicate, object");
     link(db, subject, predicate, object);
+    audit(db, agent, "link", subject, std::string(R"({"predicate":")") + predicate + R"(","object":")" + object + R"("})");
     json_t* rows = db.query_json(
         "SELECT count(*) AS c FROM statement st JOIN knowledge s ON s.id = st.subject_id "
         "JOIN knowledge p ON p.id = st.predicate_id JOIN knowledge o ON o.id = st.object_id "

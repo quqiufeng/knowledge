@@ -1,5 +1,6 @@
 #include "records.hpp"
 
+#include "spec.hpp"
 #include "util.hpp"
 
 #include <jansson.h>
@@ -91,7 +92,8 @@ class Stage {
     long count_{0};
 };
 
-void emit(Stage& stage, const RecordsOptions& opt, const std::string& source, const json_t* rec) {
+void emit(Stage& stage, const RecordsOptions& opt, const std::string& source, const json_t* rec,
+          const json_t* spec) {
     std::string kv = key_of(rec, opt.key_field);
     if (kv.empty()) return;
     std::string key = opt.prefix + kv;
@@ -119,6 +121,15 @@ void emit(Stage& stage, const RecordsOptions& opt, const std::string& source, co
         terms = kutil::dump_owned(json_deep_copy(rec));
     }
 
+    if (spec) {
+        json_t* entry = json_object();
+        json_object_set_new(entry, "key", json_string(key.c_str()));
+        json_object_set(entry, "meta", meta);
+        json_object_set(entry, "content", content);
+        spec_validate(spec, entry, key);
+        json_decref(entry);
+    }
+
     stage.add(key, kutil::dump_owned(meta), kutil::dump_owned(content), terms);
 }
 
@@ -143,6 +154,7 @@ long import_records(Db& db, const RecordsOptions& opt) {
 
     db.exec("BEGIN");
     Stage stage(db);
+    json_t* spec = spec_load(db, opt.category);
 
     if (format == "jsonl") {
         std::string line;
@@ -153,7 +165,7 @@ long import_records(Db& db, const RecordsOptions& opt) {
                 if (rec) json_decref(rec);
                 continue;
             }
-            emit(stage, opt, source, rec);
+            emit(stage, opt, source, rec, spec);
             json_decref(rec);
         }
     } else {
@@ -173,7 +185,7 @@ long import_records(Db& db, const RecordsOptions& opt) {
             for (size_t i = 0; i < cols.size() && i < vals.size(); ++i) {
                 json_object_set_new(rec, cols[i].c_str(), json_string(vals[i].c_str()));
             }
-            emit(stage, opt, source, rec);
+            emit(stage, opt, source, rec, spec);
             json_decref(rec);
         }
     }
@@ -181,5 +193,6 @@ long import_records(Db& db, const RecordsOptions& opt) {
     stage.finish();
     db.exec("DROP TABLE stg_knowledge");
     db.exec("COMMIT");
+    if (spec) json_decref(spec);
     return stage.count();
 }

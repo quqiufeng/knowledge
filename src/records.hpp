@@ -10,6 +10,7 @@ struct RecordsOptions {
     std::string kind{"record"};      // meta.kind
     std::string text_field;          // optional: field used as content.text + full-text
     std::string prefix;              // optional key prefix
+    std::string category;            // optional: validate against /spec/{category}
 };
 
 // Generic importer: any JSONL/CSV -> knowledge entries.

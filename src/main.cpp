@@ -3,10 +3,12 @@
 #include "compile.hpp"
 #include "db.hpp"
 #include "importer.hpp"
+#include "action.hpp"
 #include "embed.hpp"
 #include "memory.hpp"
 #include "records.hpp"
 #include "server.hpp"
+#include "spec.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -212,8 +214,11 @@ int usage() {
                  "agent memory (local actions; write role):\n"
                  "  remember --agent <id> --text <t> [--session s] [--about k1,k2] [--tag a,b]\n"
                  "  fact     --agent <id> --topic <t> --value <json> [--session s]\n"
-                 "  link     <subject> <predicate> <object>\n"
-                 "  forget   <key> [--force]\n"
+                 "  link     <subject> <predicate> <object> [--agent id]\n"
+                 "  put      --key K [--meta <json>] [--content <json>] [--category C] [--text T] [--agent id]\n"
+                 "  forget   <key> [--force] [--agent id]\n"
+                 "  restore  <key> [--agent id]\n"
+                 "  spec-set <category> <spec-json>   # schema-as-data; validated by put/import-records\n"
                  "\n"
                  "  seed\n"
                  "  version\n"
@@ -416,6 +421,7 @@ int main(int argc, char** argv) {
             ro.kind = opts.count("kind") ? opts["kind"] : "record";
             ro.text_field = opts.count("text-field") ? opts["text-field"] : "";
             ro.prefix = opts.count("prefix") ? opts["prefix"] : "";
+            ro.category = opts.count("category") ? opts["category"] : "";
             Db db(default_conninfo());
             long n = import_records(db, ro);
             std::cout << "{\"imported\":" << n << "}\n";
@@ -444,15 +450,39 @@ int main(int argc, char** argv) {
         if (cmd == "link") {
             if (pos.size() < 3) return usage();
             Db db(default_conninfo());
-            long c = memory_link(db, pos[0], pos[1], pos[2]);
+            long c = memory_link(db, opts.count("agent") ? opts["agent"] : "", pos[0], pos[1], pos[2]);
             std::cout << "{\"matches\":" << c << "}\n";
             return 0;
         }
         if (cmd == "forget") {
             if (pos.empty()) return usage();
             Db db(default_conninfo());
-            bool changed = memory_forget(db, pos[0], opts.count("force") > 0);
+            bool changed = action_forget(db, opts.count("agent") ? opts["agent"] : "", pos[0],
+                                         opts.count("force") > 0);
             std::cout << "{\"forgotten\":" << (changed ? "true" : "false") << "}\n";
+            return 0;
+        }
+        if (cmd == "restore") {
+            if (pos.empty()) return usage();
+            Db db(default_conninfo());
+            bool changed = action_restore(db, opts.count("agent") ? opts["agent"] : "", pos[0]);
+            std::cout << "{\"restored\":" << (changed ? "true" : "false") << "}\n";
+            return 0;
+        }
+        if (cmd == "put") {
+            Db db(default_conninfo());
+            std::string key = action_put(
+                db, opts.count("agent") ? opts["agent"] : "", opts.count("key") ? opts["key"] : "",
+                opts.count("meta") ? opts["meta"] : "{}", opts.count("content") ? opts["content"] : "{}",
+                opts.count("category") ? opts["category"] : "", opts.count("text") ? opts["text"] : "");
+            std::cout << "{\"key\":\"" << key << "\"}\n";
+            return 0;
+        }
+        if (cmd == "spec-set") {
+            if (pos.size() < 2) return usage();
+            Db db(default_conninfo());
+            spec_set(db, pos[0], pos[1]);
+            std::cout << "{\"spec\":\"/spec/" << pos[0] << "\"}\n";
             return 0;
         }
         if (cmd == "seed") {

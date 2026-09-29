@@ -126,6 +126,7 @@ JSE 算子是 AI 与存储层之间的**契约**：存储引擎（PostgreSQL / �
 | Agent 记忆（受控写 Action：remember/fact/link/forget） | ✅ 完成 |
 | 通用实体导入（JSONL/CSV → 条目） | ✅ 完成 |
 | 向量进 PG（pgvector + `$knn` + `qsearch`） | ✅ 完成 |
+| 规范条目校验 + 受控写 Action + 审计 | ✅ 完成 |
 | 多项目批量导入（16 仓库 / ~250 万 chunk） | 🚧 进行中 |
 | smoke test / 迁移对账 / 规范校验 / Action 层 | ⏳ 待办 |
 
@@ -359,6 +360,32 @@ key = /code/local/{project}/{file-relative-to-root}/{symbol}
 电子书用 `tools/vector_provider_books.sh`（`BOOK_CACHE=/book/cache`），`cache_query` 返回的 `name` 直接就是 page key，无需映射。
 
 > 说明：`related` / `search` 要命中，PG 中必须有同 key 的条目（即先跑导入器）。当前 `seed` 只灌了少量演示数据。
+
+## 规范条目（schema-as-data）与受控写 Action
+
+约束不靠外置 schema 文件，而是作为**条目**存在知识库里：
+
+```bash
+# 定义某类条目的规范（必填字段 + 类型）
+./knowledge spec-set note '{"required":["meta.title","content.text"],"types":{"meta.title":"string"}}'
+
+# 受控写：按 /spec/note 校验后 upsert
+./knowledge put --key /data/note/t1 --meta '{"kind":"note","title":"T"}' \
+                --content '{"text":"hello"}' --category note --agent dsh
+
+# 批量写入逐条校验（违反即整批回滚）
+./knowledge import-records notes.jsonl --category note --text-field text
+
+# 归档 / 恢复（不物理删除）
+./knowledge forget <key> [--force]
+./knowledge restore <key>
+```
+
+- **schema-as-data**：`/spec/{category}` 定义 `{"required":[...],"types":{...}}`；`put` / `import-records` 写入前校验。
+- **统一审计**：每个 Action 追加 `/audit/{agent}/{ts}-{pid}-{seq}`，带 `meta.action` / `meta.target`，并建 `about` 边指向目标。
+- **可回溯**：写是 upsert + 版本号，删除是归档，均可 restore。
+
+于是"本体住在库里、写入受约束、变更可审计"——从"宽松底座"升级为"受约束的结构化本体"。
 
 ---
 

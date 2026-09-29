@@ -106,6 +106,15 @@ $BIN forget "$mkey" >/dev/null 2>&1
 after=$(echo '{"$where":{"$key":{"$prefix":"/mem/smoke/events/"}},"$count":true}' | $BIN query | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['count'])" 2>/dev/null)
 [ "$after" = "0" ] && ok "forget archives; default scope excludes it" || bad "forget scope (got '$after')"
 
+echo "[smoke] spec + actions"
+$BIN spec-set smoke_spec '{"required":["meta.x"],"types":{"meta.x":"integer"}}' >/dev/null 2>&1
+okput=$($BIN put --key /data/smoke/spec1 --meta '{"x":1}' --content '{}' --category smoke_spec 2>&1)
+has '/data/smoke/spec1' "$okput" "put passes spec"
+badput=$($BIN put --key /data/smoke/spec2 --meta '{}' --content '{}' --category smoke_spec 2>&1)
+has 'missing required' "$badput" "put rejects spec violation"
+aud=$(echo '{"$where":{"$key":{"$prefix":"/audit/"}},"$count":true}' | $BIN query 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['count'])" 2>/dev/null)
+[ -n "$aud" ] && [ "$aud" -gt 0 ] && ok "actions are audited" || bad "actions are audited (got '$aud')"
+
 echo "[smoke] http api"
 if command -v curl >/dev/null 2>&1; then
     $BIN serve --port 8799 --ro --pool 2 >/tmp/ksrv.log 2>&1 &

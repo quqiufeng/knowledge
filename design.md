@@ -324,6 +324,13 @@ Agent 把本库当长期记忆。写入是**受控 Action**（本地 CLI），�
 **统一入口**：`search` 默认走 pgvector —— 嵌入查询后，向量候选来自 PG 内的 `$knn`，全文候选来自 `$fti`，RRF 在应用层融合；
 `--vector-cmd` 才回退到外挂引擎。`qsearch` 是纯 pgvector KNN 的直查。两条向量路径不再割裂。
 
+### 5.9 规范条目校验与受控写 Action
+
+- **schema-as-data**：`/spec/{category}` 存规范 `{"required":[...],"types":{...}}`；`put` 与 `import-records --category` 写入前校验（违反抛错，批量则整批回滚）。
+- **受控写**：`put`（校验 upsert）、`forget`/`restore`（归档/恢复，不物理删除）、`link`。
+- **统一审计**：每个 Action 追加 `/audit/{agent}/{ts}-{pid}-{seq}`（`meta.action`/`target`），并建 `about` 边指向目标。
+- 与 Agent 记忆 Action 共用同一套审计与归档语义。
+
 ## 6. 安全模型
 
 | 风险 | 对策 |
@@ -416,6 +423,8 @@ design.md             # 本文档
 - [x] **通用实体导入**：`import-records`（JSONL/CSV → 条目）
 - [x] **向量进 PG（pgvector）**：`embedding VECTOR(768)` + HNSW；`import-vectors`（含 bin/meta 名称校验）；`$knn` 算子（距离为主序）；`tools/embed_query.sh` + `qsearch`
 - [x] **检索统一**：`search` 默认 pgvector（`$knn` + `$fti` RRF），`--vector-cmd` 回退外挂；`source=pgvector+fti` / `vector+fti`
+- [x] **规范条目校验（schema-as-data）**：`spec-set` 定义 `/spec/{category}`；`put` / `import-records --category` 写入前校验，批量违反整批回滚
+- [x] **Action 全面化**：统一审计（`/audit/{agent}/...` + `about` 边）；通用受控写 `put`；`forget`/`restore`（归档/恢复）；`link` 纳入审计
 - [x] **Makefile 依赖跟踪**：`-MMD -MP` + `-include *.d`（此前改头文件不重编导致链接错误）
 
 ### 进行中 🚧
