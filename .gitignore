@@ -1,8 +1,49 @@
-# build artifacts
+# --- Knowledge project ---
 knowledge
-*.o
-src/*.o
 
-# local
+# --- C/C++ artifacts (from C++ template; note: Makefile is tracked source) ---
+*.d
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+*.ilk
+*.pdb
+*.so
+*.dylib
+*.dll
+*.so.*
+*.mod
+*.smod
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.out
+*.app
+
+# build dirs
+build/
+Build/
+build-*/
+
+# cmake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# misc
+*.tmp
 *.log
+*.bak
+*.swp
+vcpkg_installed/
+*.dwo
+Testing/
+.cache/
 .DS_Store
